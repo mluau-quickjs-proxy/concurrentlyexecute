@@ -1,6 +1,6 @@
 pub mod ipcmux;
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use futures_util::StreamExt;
 use ipc_channel::ipc::{IpcOneShotServer, IpcSender};
@@ -12,20 +12,6 @@ use tokio::process::Child;
 use crate::ipcmux::IpcMessage;
 
 pub type BaseError = Box<dyn std::error::Error + Send + Sync>;
-
-/// A guard that deletes a temporary file on drop
-/// 
-/// This is internal and used by concurrentlyexec to try and delete unix domain sockets 
-/// after use
-pub struct TempFileGuard {
-    path: PathBuf,
-}
-
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
 
 /// Options for creating a new thread
 pub struct ProcessOpts {
@@ -40,7 +26,8 @@ pub struct ProcessOpts {
     pub cmd_envs: Vec<(String, String)>,
     pub mem_soft_limit: i64,
     pub mem_hard_limit: i64,
-    pub start_timeout: Duration
+    pub start_timeout: Duration,
+    pub debug_print: bool,
 }
 
 impl ProcessOpts {
@@ -51,6 +38,7 @@ impl ProcessOpts {
             mem_soft_limit: 0,
             mem_hard_limit: 0,
             start_timeout: Duration::from_secs(10),
+            debug_print: false,
         }
     }
 
@@ -67,6 +55,11 @@ impl ProcessOpts {
 
     pub fn with_start_timeout(mut self, timeout: Duration) -> Self {
         self.start_timeout = timeout;
+        self
+    }
+
+    pub fn with_debug_print(mut self, debug: bool) -> Self {
+        self.debug_print = debug;
         self
     }
 }
@@ -331,6 +324,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
         cs_state: ConcurrentExecutorState<T>,
         mut opts: ProcessOpts,
     ) -> Result<Self, BaseError> {
+        let debug_print = opts.debug_print;
         let permit = cs_state.sema.clone().acquire_owned().await?;
 
         let (ipc_channel, name) = IpcOneShotServer::<IpcMessage>::new().map_err(|e| format!("Failed to create IPC oneshot server: {}", e.to_string()))?;
@@ -354,6 +348,10 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
                 "CONCURRENT_EXECUTOR_SERVER_NAME",
                 name.as_str(),
             ),
+            (
+                "CONCURRENT_EXECUTOR_DEBUG_PRINT",
+                if debug_print { "1" } else { "0" },
+            )
         ];
         for (k, v) in opts.cmd_envs.iter() {
             env.push((k.as_str(), v.as_str()));
@@ -414,13 +412,21 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
             rt.block_on(async move {
                 // Connect to the client, this creates a unidirectional channel between the server and client
                 let (rx, client_conn_pipe) = ipc_channel.accept().unwrap();
-                println!("Accepted connection from child process");
-                println!("Message from child process: {:?}", client_conn_pipe);
+                
+                if debug_print {
+                    println!("Accepted connection from child process");
+                    println!("Message from child process: {:?}", client_conn_pipe);
+                }
+                
                 // Deserialize the IpcSender from the message
                 let msg: ipcmux::IpcMuxBootstrap = client_conn_pipe.deserialize().unwrap();
                 let ntx: IpcSender<Option<Message<T>>> = ipc_channel::ipc::IpcSender::connect(msg.name).unwrap();
                 ntx.send(None).unwrap(); // Send an initial None message to establish the connection
-                println!("Connected to child process");
+                
+                if debug_print {
+                    println!("Connected to child process");
+                }
+
                 // Send the IpcSender back to the main
                 let _ = tx.send((ntx, rx));
             });
@@ -450,14 +456,26 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
     /// Starts up a process client
     /// The process should have first setup a tokio localruntime first
     pub async fn run_process_client() {
-        println!("Starting process client");
+        let debug_print = std::env::var("CONCURRENT_EXECUTOR_DEBUG_PRINT").unwrap_or_else(|_| "0".to_string()) == "1";
+        if debug_print {
+            println!("Starting process client");
+        }
+
         let name = std::env::var("CONCURRENT_EXECUTOR_SERVER_NAME").expect("CONCURRENT_EXECUTOR_SERVER_NAME not set");
         // Connect to the server
         let tx = ipc_channel::ipc::IpcSender::<IpcMessage>::connect(name).expect("Failed to connect to IPC server");
-        println!("Connected to server, setting up ipcmux");
+        
+        if debug_print {
+            println!("Connected to server, setting up ipcmux");
+        }
+
         ipcmux::IPC_TX.set(std::sync::Mutex::new(tx.clone()))
         .map_err(|_| "Failed to set IPC_TX").expect("Failed to set IPC_TX");    
-        println!("Set IPC_TX");
+
+        if debug_print {
+            println!("Set IPC_TX");
+        }
+
         // Create a second pipe for the server to send messages to the client
         let (rx, server_conn_pipe) = ipc_channel::ipc::IpcOneShotServer::<Option<Message<T>>>::new().expect("Failed to create IPC oneshot server");
         // Send the server the IpcSender to connect to
@@ -467,25 +485,40 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
             data: serde_bytes::ByteBuf::from(bincode::serde::encode_to_vec(bootstrap, bincode::config::standard()).expect("Failed to serialize IpcMuxBootstrap")),
         };
         tx.send(msg).expect("Failed to send IpcMuxBootstrap to server");
-        println!("Sent bootstrap to server, waiting for connection");
+        
+        if debug_print {
+            println!("Sent bootstrap to server, waiting for connection");
+        }
+
         let (rx, ini_msg) = rx.accept().expect("Failed to accept IPC connection from server");
-        println!("Connected to server");
+        
+        if debug_print {
+            println!("Connected to server");
+        }
 
         let cancel_token = CancellationToken::new();
         let c_token = cancel_token.clone();
         let (msgtx, msgrx) = tokio::sync::mpsc::unbounded_channel::<Message<T>>();
         assert!(ini_msg.is_none(), "Initial message from server must be None");
         let fut = async move { 
-            println!("Starting message forwarding task");
+            if debug_print {
+                println!("Starting message forwarding task");
+            }
+
             let mut rx = rx.to_stream();
             loop {
                 tokio::select! {
                     _ = c_token.cancelled() => {
-                        println!("Cancellation token triggered, exiting message forwarding task");
+                        if debug_print {
+                            println!("Cancellation token triggered, exiting message forwarding task");
+                        }
                         break;
                     }
                     s = rx.next() => {
-                        println!("Received message from server pipe");
+                        if debug_print {
+                            println!("Received message from server pipe");
+                        }
+
                         let Some(Ok(msg)) = s else {
                             continue;
                         };
@@ -494,7 +527,10 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
                         };
                         match msg {
                             Message::Data { data } => {
-                                println!("Received message from server");
+                                if debug_print {
+                                    println!("Received message from server");
+                                }
+
                                 let _ = msgtx.send(Message::Data { data });
                             },
                             Message::Shutdown => {
@@ -508,7 +544,10 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
         tokio::task::spawn(fut);
 
         // Start up the run function as a task
-        println!("Starting run function");
+        if debug_print {
+            println!("Starting run function");
+        }
+        
         T::run(msgrx).await;
         cancel_token.cancel();
     }
