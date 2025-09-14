@@ -136,6 +136,7 @@ async fn host() {
     println!("Time taken for bulk x10: {:?}", time.elapsed());
 
     executor.shutdown().unwrap();
+    executor.wait().await.unwrap();
     //tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 }
 

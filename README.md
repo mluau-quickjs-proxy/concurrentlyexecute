@@ -1,0 +1,7 @@
+# concurrentlyexec
+
+Concurrentlyexec allows for easily executing tasks concurrently in separate processes in a asynchronous (``tokio``) context. This is useful for semi-untrusted environments or isolating fragile tasks which may crash or even leak memory (or can use a lot of memory handling user input for example such as v8 isolates from ``rustyv8``).
+
+Internally, concurrentlyexec uses ``ipc-channel`` for the actual IPC. Due to ipc-channel API limitations, only ``serde`` serializable types can be sent between processes and concurrentlyexec creates 2 IPC channels per process spawn (one for server->client and one for client->server). To avoid resource exhaustion, the number of concurrently running processes is limited by a tokio semaphore to a specified bound.
+
+To enable sending responses back from the client to the server, concurrentlyexec provides its own "oneshot" channels for sending a request to a task and receiving a response back. This occurs using a internal structure/construct called ``ipcmux`` which multiplexes messages over a single IPC channel. This mean that there is a theoretical limit to the number of concurrent requests that can be made to a single process of ``u64::MAX``.

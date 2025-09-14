@@ -9,10 +9,16 @@ use crate::BaseError;
 
 pub const IPC_BOOTSTRAP_ID: u64 = 1292;
 
+#[derive(Default)]
+struct IpcMuxMap {
+    map: HashMap<u64, Sender<IpcMessage>>,
+    last: u64,
+}
+
 /// Multiplexing multiple IPC channels over a single connection
 #[derive(Clone)]
-pub struct IpcMux {
-    cmap: Arc<RwLock<HashMap<u64, Sender<IpcMessage>>>>,
+pub(crate) struct IpcMux {
+    cmap: Arc<RwLock<IpcMuxMap>>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -40,26 +46,24 @@ impl IpcMux {
     }
 
     pub fn register(&self) -> (u64, Receiver<IpcMessage>) {
-        let rg = self.cmap.read().unwrap();
+        let mut rg = self.cmap.write().unwrap();
         let id = {
+            let mut last_id = rg.last;
             loop {
-                let id = rand::random::<u64>();
-                if IpcMessage::is_reserved(id) {
-                    continue; // reserved
-                }
-                if !rg.contains_key(&id) {
-                    break id;
+                last_id = last_id.wrapping_add(1);
+                if !IpcMessage::is_reserved(last_id) && !rg.map.contains_key(&last_id) {
+                    break last_id;
                 }
             }
         };
-        drop(rg);
+        rg.last = id;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.cmap.write().unwrap().insert(id, tx);
+        rg.map.insert(id, tx);
         (id, rx)
     }
 
-    pub fn unregister(&mut self, id: &u64) {
-        self.cmap.write().unwrap().remove(id);
+    pub fn unregister(&self, id: &u64) {
+        self.cmap.write().unwrap().map.remove(id);
     }
 
     pub async fn run(&self, mut rx: ipc_channel::asynch::IpcStream<IpcMessage>, cancel_token: CancellationToken) {
@@ -74,7 +78,7 @@ impl IpcMux {
                             if IpcMessage::is_reserved(data.id) {
                                 continue; // reserved
                             }
-                            if let Some(tx) = self.cmap.write().unwrap().remove(&data.id) {
+                            if let Some(tx) = self.cmap.write().unwrap().map.remove(&data.id) {
                                 let _ = tx.send(data);
                             } else {
                                 // Unknown id, ignore
@@ -116,26 +120,40 @@ impl<T: Serialize> OneshotSender<T> {
 }
 
 pub struct OneshotReceiver<T> {
-    pub rx: Receiver<IpcMessage>,
+    rx: Option<Receiver<IpcMessage>>,
+    id: u64,
+    mux: IpcMux,
     _marker: std::marker::PhantomData<T>,
 }
 
 impl<T: for<'de> Deserialize<'de>> OneshotReceiver<T> {
     /// Receives a message from the oneshot channel
-    pub async fn recv(self) -> Result<T, BaseError> {
-        let resp = self.rx.await?;
+    pub async fn recv(mut self) -> Result<T, BaseError> {
+        let rx = std::mem::take(&mut self.rx);
+        let Some(rx) = rx else {
+            return Err("OneshotReceiver already consumed".into());
+        };
+        let resp = rx.await?;
         resp.deserialize()
     }
 }
 
-pub fn channel<T: for<'de> Deserialize<'de> + Serialize>(mux: &IpcMux) -> (OneshotSender<T>, OneshotReceiver<T>) {
+impl<T> Drop for OneshotReceiver::<T> {
+    fn drop(&mut self) {
+        self.mux.unregister(&self.id);
+    }
+}
+
+pub(crate) fn channel<T: for<'de> Deserialize<'de> + Serialize>(mux: IpcMux) -> (OneshotSender<T>, OneshotReceiver<T>) {
     let (id, rx) = mux.register();
     let tx = OneshotSender {
         id,
         _marker: std::marker::PhantomData,
     };
     let rx = OneshotReceiver {
-        rx,
+        id,
+        rx: Some(rx),
+        mux,
         _marker: std::marker::PhantomData,
     };
     (tx, rx)

@@ -1,4 +1,4 @@
-pub mod ipcmux;
+pub(crate) mod ipcmux;
 
 use std::{sync::Arc, time::Duration};
 
@@ -234,10 +234,8 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutorState<T> {
     }
 }
 
-/// Concurrent tokio execution
-///
-/// Assumes use of local tokio runtime
-pub enum ConcurrentExecutor<T: ConcurrentlyExecute> {
+/// Internal enum to store the server state of the executor
+enum ConcurrentExecutorInner<T: ConcurrentlyExecute> {
     Local {
         state: ConcurrentExecutorState<T>,
         message_tx: UnboundedSender<Message<T>>,
@@ -262,6 +260,13 @@ pub enum ConcurrentExecutor<T: ConcurrentlyExecute> {
     },
 }
 
+/// Concurrent tokio execution
+///
+/// Assumes use of local tokio runtime
+pub struct ConcurrentExecutor<T: ConcurrentlyExecute> {
+    inner: ConcurrentExecutorInner<T>,
+}
+
 impl<T: ConcurrentlyExecute> Drop for ConcurrentExecutor<T> {
     fn drop(&mut self) {
         let _ = self.shutdown();
@@ -283,10 +288,12 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
             T::run(rx).await;
         });
 
-        Ok(Self::Local {
-            state: cs_state,
-            message_tx: tx,
-            permit,
+        Ok(ConcurrentExecutor { 
+            inner: ConcurrentExecutorInner::Local {
+                state: cs_state,
+                message_tx: tx,
+                permit,
+            }
         })
     }
 
@@ -311,10 +318,12 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
         // Wait for the thread to start
         let _waited = start_rx.await?;
 
-        Ok(Self::Threaded {
-            state: cs_state,
-            message_tx: tx,
-            permit,
+        Ok(ConcurrentExecutor { 
+            inner: ConcurrentExecutorInner::Threaded {
+                state: cs_state,
+                message_tx: tx,
+                permit,
+            }
         })
     }
 
@@ -444,12 +453,14 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
             ipcmux_ref.run(rx.to_stream(), ctoken).await;
         });
 
-        Ok(Self::Process {
-            state: cs_state,
-            proc_handle: Arc::new(RwLock::new(proc_handle)),
-            permit,
-            mux: ipcmux,
-            tx,
+        Ok(ConcurrentExecutor { 
+            inner: ConcurrentExecutorInner::Process {
+                state: cs_state,
+                proc_handle: Arc::new(RwLock::new(proc_handle)),
+                permit,
+                mux: ipcmux,
+                tx,
+            }
         })
     }
 
@@ -547,27 +558,45 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
         if debug_print {
             println!("Starting run function");
         }
-        
+
         T::run(msgrx).await;
         cancel_token.cancel();
     }
 
     /// Gets the state of the executor
     pub fn get_state(&self) -> &ConcurrentExecutorState<T> {
-        match self {
-            Self::Local { state, .. } => &state,
-            Self::Threaded { state, .. } => &state,
-            Self::Process { state, .. } => &state,
+        match &self.inner {
+            ConcurrentExecutorInner::Local { state, .. } => &state,
+            ConcurrentExecutorInner::Threaded { state, .. } => &state,
+            ConcurrentExecutorInner::Process { state, .. } => &state,
+        }
+    }
+
+    /// Returns the owned permit
+    pub fn get_permit(&self) -> &OwnedSemaphorePermit {
+        match &self.inner {
+            ConcurrentExecutorInner::Local { permit, .. } |
+            ConcurrentExecutorInner::Threaded { permit, .. } |
+            ConcurrentExecutorInner::Process { permit, .. } => permit,
+        }
+    }
+
+    /// Returns the owned permit as a mutable reference
+    pub fn get_permit_mut(&mut self) -> &mut OwnedSemaphorePermit {
+        match &mut self.inner {
+            ConcurrentExecutorInner::Local { permit, .. } |
+            ConcurrentExecutorInner::Threaded { permit, .. } |
+            ConcurrentExecutorInner::Process { permit, .. } => permit,
         }
     }
 
     /// Sends a message to the executor
     pub fn send_raw(&self, msg: Message<T>) -> Result<(), BaseError> {
-        match self {
-            Self::Local { message_tx, .. } | Self::Threaded { message_tx, ..} => {
+        match &self.inner {
+            ConcurrentExecutorInner::Local { message_tx, .. } | ConcurrentExecutorInner::Threaded { message_tx, ..} => {
                 message_tx.send(msg)?;
             }
-            Self::Process { tx, .. } => {
+            ConcurrentExecutorInner::Process { tx, .. } => {
                 match tx.send(Some(msg)) {
                     Ok(_) => {},
                     Err(e) => {
@@ -589,17 +618,13 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
     /// 
     /// This should replace all use of tokio::sync::oneshot::channel function
     pub fn create_oneshot<U: Serialize + DeserializeOwned + Send + 'static>(&self) -> (OneshotSender<U>, OneshotReceiver<U>) {
-        match self {
-            Self::Local { .. } => {
+        match &self.inner {
+            ConcurrentExecutorInner::Local { .. } | ConcurrentExecutorInner::Threaded { .. } => {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 (OneshotSender::new_local(tx), OneshotReceiver::new_local(rx))
             }
-            Self::Threaded { .. } => {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                (OneshotSender::new_local(tx), OneshotReceiver::new_local(rx))
-            }
-            Self::Process { mux, .. } => {
-                let (tx, rx) = ipcmux::channel(mux);
+            ConcurrentExecutorInner::Process { mux, .. } => {
+                let (tx, rx) = ipcmux::channel(mux.clone());
                 (OneshotSender::new_process(tx), OneshotReceiver::new_process(rx))
             }
         }
@@ -607,16 +632,12 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
 
     /// Waits for the executor to finish executing(?)
     pub async fn wait(&self) -> Result<(), BaseError> {
-        match self {
-            Self::Local { .. } => {
+        match &self.inner {
+            ConcurrentExecutorInner::Local { .. } | ConcurrentExecutorInner::Threaded { .. } => {
                 // Local executors run in the background, so we just wait for the cancel token
                 self.get_state().cancel_token.cancelled().await;
             }
-            Self::Threaded { .. } => {
-                // Threaded executors run in the background, so we just wait for the cancel token
-                self.get_state().cancel_token.cancelled().await;
-            }
-            Self::Process { proc_handle, .. } => {
+            ConcurrentExecutorInner::Process { proc_handle, .. } => {
                 let proc_handle = proc_handle.clone();
                 let cancel_token = self.get_state().cancel_token.clone();
                 let fut = async move {
@@ -638,14 +659,11 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
     /// Shuts down the executor
     pub fn shutdown(&self) -> Result<(), BaseError> {
         let _ = self.send_raw(Message::Shutdown);
-        match self {
-            Self::Local { .. } => {
+        match &self.inner {
+            ConcurrentExecutorInner::Local { .. } | ConcurrentExecutorInner::Threaded { .. } => {
                 self.get_state().cancel_token.cancel();
             }
-            Self::Threaded { .. } => {
-                self.get_state().cancel_token.cancel();
-            }
-            Self::Process { proc_handle, .. } => {
+            ConcurrentExecutorInner::Process { proc_handle, .. } => {
                 // Give some time for the process to exit gracefully
                 let proc_handle = proc_handle.clone();
                 self.get_state().cancel_token.cancel();
