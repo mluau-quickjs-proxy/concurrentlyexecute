@@ -684,15 +684,6 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
     }
 }
 
-#[derive(Clone)]
-pub struct CloneableConcurrentExecutor<T: ConcurrentlyExecute>(pub Arc<ConcurrentExecutor<T>>);
-impl<T: ConcurrentlyExecute> std::ops::Deref for CloneableConcurrentExecutor<T> {
-    type Target = ConcurrentExecutor<T>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use tokio::runtime::LocalOptions;
