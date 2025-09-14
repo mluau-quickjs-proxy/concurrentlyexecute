@@ -137,6 +137,26 @@ async fn host() {
 
     executor.shutdown().unwrap();
     executor.wait().await.unwrap();
+
+    println!("====== Testing blocking shutdown ======");
+    let time = std::time::Instant::now();
+    let (tx, rx) = executor.create_oneshot();
+    executor.send(MpTaskMessage::AddToTestStruct { s: TestStruct { a: 5, b: "Hello".to_string() }, resp: tx }).unwrap();
+    let (tx, _rx) = executor.create_oneshot();
+    executor.send(MpTaskMessage::AddToTestStruct { s: TestStruct { a: 5, b: "Hello".to_string() }, resp: tx }).unwrap();
+    println!("Time taken [send]: {:?}", time.elapsed());
+    let response = tokio::time::timeout(
+        tokio::time::Duration::from_secs(5),
+        rx.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    println!("Time taken: {:?}", time.elapsed());
+    println!("Got response from child: a = {}, b = {}", response.a, response.b);
+    assert!(response.a == 15);
+    assert!(response.b == "Hello (modified)");
+
     //tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 }
 
