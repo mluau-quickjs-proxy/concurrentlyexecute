@@ -144,19 +144,28 @@ async fn child() {
 }
 
 fn main() {
+    let std_args: Vec<String> = std::env::args().collect();
+    if std_args.len() > 1 && std_args[1] == "--child" {
+        let rt = Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async move {
+            println!("Starting child process");
+            child().await;
+        });
+
+        return;
+    }
+
+
     let rt = Builder::new_current_thread()
         .enable_all()
         .build_local(LocalOptions::default())
         .unwrap();
 
     rt.block_on(async move {
-        let std_args: Vec<String> = std::env::args().collect();
-        if std_args.len() > 1 && std_args[1] == "--child" {
-            // Child process
-            println!("Starting child process");
-            child().await;
-        } else {
-            host().await;
-        }
+        host().await;
     });
 }
