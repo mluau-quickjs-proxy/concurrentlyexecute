@@ -1,0 +1,12 @@
+[package]
+name = "concurrentlyexec"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+remoc = { version = "0.18", features = [] }
+cgroups-rs = "0.4"
+tokio = { version = "1", features = ["full", "process"] }
+tokio-util = "0.7"
+serde = "1"
+rand = "0.9"
