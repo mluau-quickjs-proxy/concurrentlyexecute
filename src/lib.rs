@@ -1,10 +1,15 @@
+pub mod ipcmux;
+
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use remoc::rch::mpsc::Sender;
+use futures_util::StreamExt;
+use ipc_channel::ipc::{IpcOneShotServer, IpcSender};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tokio::sync::{mpsc::{UnboundedReceiver, UnboundedSender}, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::{runtime::{LocalOptions}, sync::{mpsc::{UnboundedReceiver, UnboundedSender}, OwnedSemaphorePermit, RwLock, Semaphore}};
 use tokio_util::sync::CancellationToken;
 use tokio::process::Child;
+
+use crate::ipcmux::IpcMessage;
 
 pub type BaseError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -74,7 +79,7 @@ pub enum OneshotSender<T> {
         sender: tokio::sync::oneshot::Sender<T>,
     },
     Process {
-        sender: remoc::rch::oneshot::Sender<T>,
+        sender: ipcmux::OneshotSender<T>
     },
 }
 
@@ -85,7 +90,7 @@ impl<T: Serialize + DeserializeOwned + Send + 'static> OneshotSender<T> {
     }
 
     /// Creates a new process oneshot sender
-    pub fn new_process(sender: remoc::rch::oneshot::Sender<T>) -> Self {
+    pub fn new_process(sender: ipcmux::OneshotSender<T>) -> Self {
         Self::Process { sender }
     }
 
@@ -130,7 +135,7 @@ impl<'de, T: Serialize + DeserializeOwned + Send + 'static> Deserialize<'de> for
     where
         D: serde::Deserializer<'de>,
     {
-        let sender = remoc::rch::oneshot::Sender::<T>::deserialize(deserializer)?;
+        let sender = ipcmux::OneshotSender::<T>::deserialize(deserializer)?;
         Ok(Self::Process { sender })
     }
 }
@@ -140,7 +145,7 @@ pub enum OneshotReceiver<T> {
         receiver: tokio::sync::oneshot::Receiver<T>,
     },
     Process {
-        receiver: remoc::rch::oneshot::Receiver<T>,
+        receiver: ipcmux::OneshotReceiver<T>,
     },
 }
 
@@ -151,7 +156,7 @@ impl<T: Serialize + DeserializeOwned + Send + 'static> OneshotReceiver<T> {
     }
 
     /// Creates a new process oneshot receiver
-    pub fn new_process(receiver: remoc::rch::oneshot::Receiver<T>) -> Self {
+    pub fn new_process(receiver: ipcmux::OneshotReceiver<T>) -> Self {
         Self::Process { receiver }
     }
 
@@ -165,39 +170,12 @@ impl<T: Serialize + DeserializeOwned + Send + 'static> OneshotReceiver<T> {
                 }
             }
             Self::Process { receiver } => {
-                match receiver.await {
+                match receiver.recv().await {
                     Ok(value) => Ok(value),
                     Err(e) => Err(format!("Failed to receive value from process oneshot receiver: {}", e.to_string()).into()),
                 }
             }
         }
-    }
-}
-
-impl<T: Serialize + DeserializeOwned + Send + 'static> Serialize for OneshotReceiver<T> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        match self {
-            Self::Local { .. } => {
-                Err(serde::ser::Error::custom("Cannot serialize local oneshot receiver"))
-            }
-            Self::Process { receiver } => {
-                // Serialize as [0, receiver]
-                receiver.serialize(serializer)
-            }
-        }
-    }
-}
-
-impl<'de, T: Serialize + DeserializeOwned + Send + 'static> Deserialize<'de> for OneshotReceiver<T> {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let receiver = remoc::rch::oneshot::Receiver::<T>::deserialize(deserializer)?;
-        Ok(Self::Process { receiver })
     }
 }
 
@@ -207,9 +185,8 @@ pub enum ProcessMessage<T: ConcurrentlyExecute> {
     Message {
         data: Message<T>,
     },
-    LoadMpsc {
-        recv: remoc::rch::mpsc::Receiver<ProcessMessage<T>>,
-        recieved: remoc::rch::oneshot::Sender<()>,
+    CreateServerClientConn {
+        name: String
     }
 }
 
@@ -280,14 +257,15 @@ pub enum ConcurrentExecutor<T: ConcurrentlyExecute> {
     },
     Process {
         state: ConcurrentExecutorState<T>,
-        message_tx: Sender<ProcessMessage<T>>,
         proc_handle: Arc<RwLock<Child>>,
         permit: OwnedSemaphorePermit,
-        uds_path: TempFileGuard, // On drop, this destroys the file
 
-        // Not used, but we need to keep them around
-        tx: remoc::rch::base::Sender<ProcessMessage<T>, remoc::codec::PostbagSlim>,
-        rx: remoc::rch::base::Receiver<ProcessMessage<T>, remoc::codec::PostbagSlim>
+        // Sends IpcMessage to the child via ipcmux
+        //
+        // The server will also spawn a task to listen for messages from the child
+        // which is a IpcReceiver<IpcMessage>
+        mux: ipcmux::IpcMux,
+        tx: IpcSender<Option<Message<T>>>, // Option to enable sending an initial None message
     },
 }
 
@@ -354,27 +332,8 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
         mut opts: ProcessOpts,
     ) -> Result<Self, BaseError> {
         let permit = cs_state.sema.clone().acquire_owned().await?;
-        // Create a unix socket pair for communication
-        let rand_str = {
-            use rand::Rng;
 
-            fn generate_random_alphanumeric_string(length: usize) -> String {
-                const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-                let mut rng = rand::rng();
-                let random_string: String = (0..length)
-                    .map(|_| {
-                        let idx = rng.random_range(0..CHARSET.len());
-                        CHARSET[idx] as char
-                    })
-                    .collect();
-                random_string
-            }
-
-            generate_random_alphanumeric_string(16)
-        };
-        let pbuf = std::env::temp_dir().join(format!("ce{rand_str}.sock"));
-        let uds_path = TempFileGuard { path: pbuf.clone() };
-        let unix_listener = tokio::net::UnixListener::bind(&uds_path.path)?;
+        let (ipc_channel, name) = IpcOneShotServer::<IpcMessage>::new().map_err(|e| format!("Failed to create IPC oneshot server: {}", e.to_string()))?;
 
         // Spawn the process here
         // Note that we do not touch stdout/stdin/stderr as the child process
@@ -392,8 +351,8 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
         let args = opts.cmd_argv[1..].to_vec();
         let mut env = vec![
             (
-                "CONCURRENT_EXECUTOR_UDS_PATH",
-                uds_path.path.as_os_str().to_str().ok_or("Failed to convert UDS path to str")?,
+                "CONCURRENT_EXECUTOR_SERVER_NAME",
+                name.as_str(),
             ),
         ];
         for (k, v) in opts.cmd_envs.iter() {
@@ -403,7 +362,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
         cmd.args(args);
         cmd.envs(env);
         cmd.kill_on_drop(true);
-        let mut proc_handle = cmd.spawn()?;
+        let proc_handle = cmd.spawn()?;
 
         // Set cgroups up if on unix and memory limits are set
         let mut _guard = None;
@@ -445,131 +404,113 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
         }
         
         // Wait for a connection
-        let timer = tokio::time::sleep(opts.start_timeout);
-        let (stream, _addr) = tokio::select! {
-            _ = timer => {
-                return Err("Timed out waiting for process to connect".into());
-            }
-            res = unix_listener.accept() => res?,
-            _ = proc_handle.wait() => {
-                cs_state.cancel_token.cancel();
-                return Err("Process exited before connecting".into());
-            }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build_local(LocalOptions::default())
+                .expect("Failed to create tokio runtime");
+
+            rt.block_on(async move {
+                // Connect to the client, this creates a unidirectional channel between the server and client
+                let (rx, client_conn_pipe) = ipc_channel.accept().unwrap();
+                println!("Accepted connection from child process");
+                println!("Message from child process: {:?}", client_conn_pipe);
+                // Deserialize the IpcSender from the message
+                let msg: ipcmux::IpcMuxBootstrap = client_conn_pipe.deserialize().unwrap();
+                let ntx: IpcSender<Option<Message<T>>> = ipc_channel::ipc::IpcSender::connect(msg.name).unwrap();
+                ntx.send(None).unwrap(); // Send an initial None message to establish the connection
+                println!("Connected to child process");
+                // Send the IpcSender back to the main
+                let _ = tx.send((ntx, rx));
+            });
+        });
+        let (tx, rx) = match tokio::time::timeout(opts.start_timeout, rx).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err(format!("Failed to receive IPC connection from child process: {}", e.to_string()).into()),
+            Err(_) => return Err("Timed out waiting for IPC connection from child process".into()),
         };
 
-        // Create remoc channel
-        let (reader, writer) = stream.into_split();
-        let (conn, mut tx, rx) = remoc::Connect::io::<tokio::net::unix::OwnedReadHalf, tokio::net::unix::OwnedWriteHalf, ProcessMessage<T>, ProcessMessage<T>, remoc::codec::PostbagSlim>(
-            remoc::Cfg::balanced(), 
-            reader, 
-            writer, 
-        )
-            .await
-            .map_err(|e| format!("Failed to create remoc connection: {}", e.to_string()))?;
-        
-        let cancel_token = cs_state.cancel_token.clone();
-        let fut = async move { 
-            tokio::select! {
-                _ = cancel_token.cancelled() => {}
-                _ = conn => {
-                }
-            }
-        };
-
-        tokio::task::spawn(fut);
-
-        let (message_tx, message_rx) = remoc::rch::mpsc::channel::<ProcessMessage<T>, _>(256);
-        let (conn_finished_tx, conn_finished_rx) = remoc::rch::oneshot::channel();
-        tx.send(ProcessMessage::LoadMpsc { recv: message_rx, recieved: conn_finished_tx }).await.map_err(|e| format!("Failed to send LoadMpsc message to process: {}", e.to_string()))?;
-        // Wait for the process to acknowledge receiving the LoadMpsc message
-        let _ = tokio::time::timeout(opts.start_timeout, conn_finished_rx).await
-            .map_err(|_| "Timed out waiting for process to acknowledge LoadMpsc message")?
-            .map_err(|e| format!("Failed to receive acknowledgement from process: {}", e.to_string()))?;
+        let ipcmux = ipcmux::IpcMux::new();
+        let ipcmux_ref = ipcmux.clone();
+        let ctoken = cs_state.cancel_token.clone();
+        tokio::task::spawn(async move {
+            ipcmux_ref.run(rx.to_stream(), ctoken).await;
+        });
 
         Ok(Self::Process {
             state: cs_state,
-            message_tx,
             proc_handle: Arc::new(RwLock::new(proc_handle)),
             permit,
-            uds_path,
+            mux: ipcmux,
             tx,
-            rx,
         })
     }
 
     /// Starts up a process client
     /// The process should have first setup a tokio localruntime first
     pub async fn run_process_client() {
-        let uds_path = std::env::var("CONCURRENT_EXECUTOR_UDS_PATH").expect("CONCURRENT_EXECUTOR_UDS_PATH not set");
-        let stream = tokio::net::UnixStream::connect(uds_path).await.expect("Failed to connect to UDS path");
-
-        let (reader, writer) = stream.into_split();
-        let (conn, _tx, rx) = remoc::Connect::io::<tokio::net::unix::OwnedReadHalf, tokio::net::unix::OwnedWriteHalf, ProcessMessage<T>, ProcessMessage<T>, remoc::codec::PostbagSlim>(
-            remoc::Cfg::balanced(), 
-            reader, 
-            writer, 
-        )
-            .await
-            .expect("Failed to create remoc connection");
+        println!("Starting process client");
+        let name = std::env::var("CONCURRENT_EXECUTOR_SERVER_NAME").expect("CONCURRENT_EXECUTOR_SERVER_NAME not set");
+        // Connect to the server
+        let tx = ipc_channel::ipc::IpcSender::<IpcMessage>::connect(name).expect("Failed to connect to IPC server");
+        println!("Connected to server, setting up ipcmux");
+        ipcmux::IPC_TX.set(std::sync::Mutex::new(tx.clone()))
+        .map_err(|_| "Failed to set IPC_TX").expect("Failed to set IPC_TX");    
+        println!("Set IPC_TX");
+        // Create a second pipe for the server to send messages to the client
+        let (rx, server_conn_pipe) = ipc_channel::ipc::IpcOneShotServer::<Option<Message<T>>>::new().expect("Failed to create IPC oneshot server");
+        // Send the server the IpcSender to connect to
+        let bootstrap = ipcmux::IpcMuxBootstrap { name: server_conn_pipe };
+        let msg = IpcMessage {
+            id: ipcmux::IPC_BOOTSTRAP_ID,
+            data: serde_bytes::ByteBuf::from(bincode::serde::encode_to_vec(bootstrap, bincode::config::standard()).expect("Failed to serialize IpcMuxBootstrap")),
+        };
+        tx.send(msg).expect("Failed to send IpcMuxBootstrap to server");
+        println!("Sent bootstrap to server, waiting for connection");
+        let (rx, ini_msg) = rx.accept().expect("Failed to accept IPC connection from server");
+        println!("Connected to server");
 
         let cancel_token = CancellationToken::new();
         let c_token = cancel_token.clone();
+        let (msgtx, msgrx) = tokio::sync::mpsc::unbounded_channel::<Message<T>>();
+        assert!(ini_msg.is_none(), "Initial message from server must be None");
         let fut = async move { 
-            tokio::select! {
-                _ = c_token.cancelled() => {}
-                _ = conn => {
+            println!("Starting message forwarding task");
+            let mut rx = rx.to_stream();
+            loop {
+                tokio::select! {
+                    _ = c_token.cancelled() => {
+                        println!("Cancellation token triggered, exiting message forwarding task");
+                        break;
+                    }
+                    s = rx.next() => {
+                        println!("Received message from server pipe");
+                        let Some(Ok(msg)) = s else {
+                            continue;
+                        };
+                        let Some(msg) = msg else {
+                            continue;
+                        };
+                        match msg {
+                            Message::Data { data } => {
+                                println!("Received message from server");
+                                let _ = msgtx.send(Message::Data { data });
+                            },
+                            Message::Shutdown => {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         };
         tokio::task::spawn(fut);
 
-        let mut message_rx: Option<remoc::rch::mpsc::Receiver<ProcessMessage<T>>> = None;
-
-        let mut rx = rx;
-        while let Some(msg) = rx.recv().await.expect("Failed to receive message from parent process") {
-            match msg {
-                ProcessMessage::LoadMpsc { recv, recieved } => {
-                    println!("Received LoadMpsc message");
-                    message_rx = Some(recv);
-                    recieved.send(()).expect("Failed to send LoadMpsc acknowledgement");
-                    break;
-                }
-                _ => {
-                    panic!("Received unexpected message before LoadMpsc");
-                }
-            }
-        }
-
-        let mut message_rx = message_rx.expect("Did not receive LoadMpsc message");
-
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         // Start up the run function as a task
-        tokio::task::spawn_local(T::run(rx));
-
-        loop {
-            tokio::select! {
-                msg = message_rx.recv() => {
-                    let Ok(msg) = msg else {
-                        panic!("Failed to receive message from parent process");
-                    };
-                    let Some(msg) = msg else {
-                        continue;
-                    };
-                    match msg {
-                        ProcessMessage::Message { data } => {
-                            let _ = tx.send(data);
-                            //tokio::task::yield_now().await;
-                        }
-                        ProcessMessage::LoadMpsc { .. } => {
-                            panic!("Received unexpected LoadMpsc message");
-                        }
-                    }
-                }
-                _ = cancel_token.cancelled() => {
-                    break;
-                }
-            }
-        }
+        println!("Starting run function");
+        T::run(msgrx).await;
+        cancel_token.cancel();
     }
 
     /// Gets the state of the executor
@@ -582,13 +523,13 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
     }
 
     /// Sends a message to the executor
-    pub async fn send(&self, msg: T::Message) -> Result<(), BaseError> {
+    pub fn send_raw(&self, msg: Message<T>) -> Result<(), BaseError> {
         match self {
             Self::Local { message_tx, .. } | Self::Threaded { message_tx, ..} => {
-                message_tx.send(Message::Data { data: msg })?;
+                message_tx.send(msg)?;
             }
-            Self::Process { message_tx, .. } => {
-                match message_tx.send(ProcessMessage::Message { data: Message::Data { data: msg }}).await {
+            Self::Process { tx, .. } => {
+                match tx.send(Some(msg)) {
                     Ok(_) => {},
                     Err(e) => {
                         return Err(format!("Failed to send message to process executor: {}", e.to_string()).into());
@@ -597,6 +538,11 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
             }
         }
         Ok(())
+    }
+
+    /// Sends a message to the executor
+    pub fn send(&self, msg: T::Message) -> Result<(), BaseError> {
+        self.send_raw( Message::Data { data: msg } )
     }
 
     /// Creates a new oneshot sender/receiver pair
@@ -613,8 +559,8 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 (OneshotSender::new_local(tx), OneshotReceiver::new_local(rx))
             }
-            Self::Process { .. } => {
-                let (tx, rx) = remoc::rch::oneshot::channel();
+            Self::Process { mux, .. } => {
+                let (tx, rx) = ipcmux::channel(mux);
                 (OneshotSender::new_process(tx), OneshotReceiver::new_process(rx))
             }
         }
@@ -652,17 +598,15 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
 
     /// Shuts down the executor
     pub fn shutdown(&self) -> Result<(), BaseError> {
+        let _ = self.send_raw(Message::Shutdown);
         match self {
-            Self::Local { message_tx, .. } => {
-                message_tx.send(Message::Shutdown)?;
+            Self::Local { .. } => {
                 self.get_state().cancel_token.cancel();
             }
-            Self::Threaded { message_tx, .. } => {
-                message_tx.send(Message::Shutdown)?;
+            Self::Threaded { .. } => {
                 self.get_state().cancel_token.cancel();
             }
-            Self::Process { message_tx, proc_handle, .. } => {
-                let _ = message_tx.send(ProcessMessage::Message { data: Message::Shutdown });
+            Self::Process { proc_handle, .. } => {
                 // Give some time for the process to exit gracefully
                 let proc_handle = proc_handle.clone();
                 self.get_state().cancel_token.cancel();

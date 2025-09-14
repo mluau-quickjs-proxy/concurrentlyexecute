@@ -34,6 +34,12 @@ impl ConcurrentlyExecute for MpTask {
                         }
                         concurrentlyexec::Message::Data { data: MpTaskMessage::Request { msg, resp } } => {
                             // Just echo the message back
+                            if msg == "0" {
+                                // Simulate a long task
+                                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                                let _ = resp.send("Long task done".to_string());
+                                continue;
+                            }
                             let _ = resp.send(format!("Echo: {}", msg));
                         }
                     }
@@ -51,7 +57,7 @@ async fn host() {
     let executor = ConcurrentExecutor::<MpTask>::new_process(state, ProcessOpts::new(vec!["-".to_string(), "--child".to_string()])).await.unwrap();
     let (tx, rx) = executor.create_oneshot();
     let time = std::time::Instant::now();
-    executor.send(MpTaskMessage::Request { msg: "Hello from host".to_string(), resp: tx }).await.unwrap();
+    executor.send(MpTaskMessage::Request { msg: "Hello from host".to_string(), resp: tx }).unwrap();
     println!("Time taken [send]: {:?}", time.elapsed());
     let response = rx.recv().await.unwrap();
     println!("Time taken: {:?}", time.elapsed());
@@ -59,7 +65,17 @@ async fn host() {
 
     let time = std::time::Instant::now();
     let (tx, rx) = executor.create_oneshot();
-    executor.send(MpTaskMessage::Request { msg: "Hello from host 2".to_string(), resp: tx }).await.unwrap();
+    executor.send(MpTaskMessage::Request { msg: "Hello from host 2".to_string(), resp: tx }).unwrap();
+    println!("Time taken [send]: {:?}", time.elapsed());
+    let response = rx.recv().await.unwrap();
+    println!("Time taken: {:?}", time.elapsed());
+    println!("Got response from child: {}", response);
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+    let time = std::time::Instant::now();
+    let (tx, rx) = executor.create_oneshot();
+    executor.send(MpTaskMessage::Request { msg: "0".to_string(), resp: tx }).unwrap();
     println!("Time taken [send]: {:?}", time.elapsed());
     let response = rx.recv().await.unwrap();
     println!("Time taken: {:?}", time.elapsed());
