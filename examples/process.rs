@@ -1,3 +1,4 @@
+use concurrentlyexec::ClientContext;
 use concurrentlyexec::ConcurrentExecutor;
 use concurrentlyexec::ConcurrentExecutorState;
 use concurrentlyexec::ConcurrentlyExecute;
@@ -38,6 +39,7 @@ impl ConcurrentlyExecute for MpTask {
 
     async fn run(
         mut rx: tokio::sync::mpsc::UnboundedReceiver<concurrentlyexec::Message<Self>>, 
+        ctx: ClientContext,
     ) {
         loop {
             tokio::select! {
@@ -51,19 +53,19 @@ impl ConcurrentlyExecute for MpTask {
                             if msg == "0" {
                                 // Simulate a long task
                                 tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                                let _ = resp.send("Long task done".to_string());
+                                let _ = resp.send(&ctx, "Long task done".to_string());
                                 continue;
                             }
-                            let _ = resp.send(format!("Echo: {}", msg));
+                            let _ = resp.send(&ctx, format!("Echo: {}", msg));
                         }
                         concurrentlyexec::Message::Data { data: MpTaskMessage::MultiplyByTen { x, resp } } => {
-                            let _ = resp.send(x * 10);
+                            let _ = resp.send(&ctx, x * 10);
                         }
                         concurrentlyexec::Message::Data { data: MpTaskMessage::AddToTestStruct { s, resp } } => {
                             let mut ns = s;
                             ns.a += 10;
                             ns.b = format!("{} (modified)", ns.b);
-                            let _ = resp.send(ns);
+                            let _ = resp.send(&ctx, ns);
                         }
                     }
                 }

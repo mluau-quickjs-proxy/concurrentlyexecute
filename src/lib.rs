@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 use tokio::process::Child;
 
 use crate::ipcmux::IpcMessage;
+pub use crate::ipcmux::ClientContext;
 
 pub type BaseError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -88,13 +89,13 @@ impl<T: Serialize + DeserializeOwned + Send + 'static> OneshotSender<T> {
     }
 
     /// Sends a value through the oneshot sender
-    pub fn send(self, value: T) -> Result<(), BaseError> {
+    pub fn send(self, ctx: &ClientContext, value: T) -> Result<(), BaseError> {
         match self {
             Self::Local { sender } => {
                 let _ = sender.send(value);
             }
             Self::Process { sender } => {
-                match sender.send(value) {
+                match sender.upgrade(ctx).send(value) {
                     Ok(_) => {},
                     Err(e) => {
                         return Err(format!("Failed to send value through process oneshot sender: {}", e.to_string()).into());
@@ -172,6 +173,114 @@ impl<T: Serialize + DeserializeOwned + Send + 'static> OneshotReceiver<T> {
     }
 }
 
+/// A oneshot sender that can be either local or process
+/// 
+/// This should be used in place of tokio oneshot/remoc directly
+pub enum MultiSender<T> {
+    Local {
+        sender: tokio::sync::mpsc::UnboundedSender<T>,
+    },
+    Process {
+        sender: ipcmux::MultiSender<T>
+    },
+}
+
+impl<T: Serialize + DeserializeOwned + Send + 'static> MultiSender<T> {
+    /// Creates a new local oneshot sender
+    pub fn new_local(sender: tokio::sync::mpsc::UnboundedSender<T>) -> Self {
+        Self::Local { sender }
+    }
+
+    /// Creates a new process multi sender
+    pub fn new_process(sender: ipcmux::MultiSender<T>) -> Self {
+        Self::Process { sender }
+    }
+
+    /// Sends a value through the multi sender
+    pub fn send(&self, ctx: &ClientContext, value: T) -> Result<(), BaseError> {
+        match self {
+            Self::Local { sender } => {
+                let _ = sender.send(value);
+            }
+            Self::Process { sender } => {
+                match sender.upgrade(ctx).send(value) {
+                    Ok(_) => {},
+                    Err(e) => {
+                        return Err(format!("Failed to send value through process oneshot sender: {}", e.to_string()).into());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<T: Serialize + DeserializeOwned + Send + 'static> Serialize for MultiSender<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Local { .. } => {
+                Err(serde::ser::Error::custom("Cannot serialize local oneshot sender"))
+            }
+            Self::Process { sender } => {
+                // Serialize as [0, sender]
+                sender.serialize(serializer)
+            }
+        }
+    }
+}
+
+impl<'de, T: Serialize + DeserializeOwned + Send + 'static> Deserialize<'de> for MultiSender<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let sender = ipcmux::MultiSender::<T>::deserialize(deserializer)?;
+        Ok(Self::Process { sender })
+    }
+}
+
+pub enum MultiReceiver<T> {
+    Local {
+        receiver: tokio::sync::mpsc::UnboundedReceiver<T>,
+    },
+    Process {
+        receiver: ipcmux::MultiReceiver<T>,
+    },
+}
+
+impl<T: Serialize + DeserializeOwned + Send + 'static> MultiReceiver<T> {
+    /// Creates a new local multi receiver
+    pub fn new_local(receiver: tokio::sync::mpsc::UnboundedReceiver<T>) -> Self {
+        Self::Local { receiver }
+    }
+
+    /// Creates a new process multi receiver
+    pub fn new_process(receiver: ipcmux::MultiReceiver<T>) -> Self {
+        Self::Process { receiver }
+    }
+
+    /// Receives a value from the multi receiver
+    pub async fn recv(&mut self) -> Result<T, BaseError> {
+        match self {
+            Self::Local { receiver } => {
+                match receiver.recv().await {
+                    Some(value) => Ok(value),
+                    None => Err("MultiReceiver channel closed".into()),
+                }
+            }
+            Self::Process { receiver } => {
+                match receiver.recv().await {
+                    Ok(value) => Ok(value),
+                    Err(e) => Err(format!("Failed to receive value from process oneshot receiver: {}", e.to_string()).into()),
+                }
+            }
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(bound = "")]
 pub enum ProcessMessage<T: ConcurrentlyExecute> {
@@ -199,6 +308,7 @@ pub trait ConcurrentlyExecute: Send + Sync + Clone + Sized + 'static {
 
     async fn run(
         rx: UnboundedReceiver<Message<Self>>, 
+        client_ctx: ClientContext
     );
 }
 
@@ -285,7 +395,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         
         tokio::task::spawn_local(async move {
-            T::run(rx).await;
+            T::run(rx, ClientContext { chan:None }).await;
         });
 
         Ok(ConcurrentExecutor { 
@@ -312,7 +422,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
                 .expect("Failed to create tokio runtime");
             runtime.block_on(async move {
                 let _ = start_tx.send(());
-                T::run(rx).await;
+                T::run(rx, ClientContext { chan:None }).await;
             });
         });
         // Wait for the thread to start
@@ -474,14 +584,11 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
 
         let name = std::env::var("CONCURRENT_EXECUTOR_SERVER_NAME").expect("CONCURRENT_EXECUTOR_SERVER_NAME not set");
         // Connect to the server
-        let tx = ipc_channel::ipc::IpcSender::<IpcMessage>::connect(name).expect("Failed to connect to IPC server");
+        let tx_ipcmux = ipc_channel::ipc::IpcSender::<IpcMessage>::connect(name).expect("Failed to connect to IPC server");
         
         if debug_print {
             println!("Connected to server, setting up ipcmux");
         }
-
-        ipcmux::IPC_TX.set(std::sync::Mutex::new(tx.clone()))
-        .map_err(|_| "Failed to set IPC_TX").expect("Failed to set IPC_TX");    
 
         if debug_print {
             println!("Set IPC_TX");
@@ -493,9 +600,10 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
         let bootstrap = ipcmux::IpcMuxBootstrap { name: server_conn_pipe };
         let msg = IpcMessage {
             id: ipcmux::IPC_BOOTSTRAP_ID,
+            mpsc: false,
             data: serde_bytes::ByteBuf::from(bincode::serde::encode_to_vec(bootstrap, bincode::config::standard()).expect("Failed to serialize IpcMuxBootstrap")),
         };
-        tx.send(msg).expect("Failed to send IpcMuxBootstrap to server");
+        tx_ipcmux.send(msg).expect("Failed to send IpcMuxBootstrap to server");
         
         if debug_print {
             println!("Sent bootstrap to server, waiting for connection");
@@ -559,7 +667,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
             println!("Starting run function");
         }
 
-        T::run(msgrx).await;
+        T::run(msgrx, ClientContext { chan: Some(tx_ipcmux) }).await;
         cancel_token.cancel();
     }
 
@@ -626,6 +734,23 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
             ConcurrentExecutorInner::Process { mux, .. } => {
                 let (tx, rx) = ipcmux::channel(mux.clone());
                 (OneshotSender::new_process(tx), OneshotReceiver::new_process(rx))
+            }
+        }
+    }    
+    
+    /// Creates a new oneshot sender/receiver pair
+    /// according to the type of executor
+    /// 
+    /// This should replace all use of tokio::sync::oneshot::channel function
+    pub fn create_multi<U: Serialize + DeserializeOwned + Send + 'static>(&self) -> (MultiSender<U>, MultiReceiver<U>) {
+        match &self.inner {
+            ConcurrentExecutorInner::Local { .. } | ConcurrentExecutorInner::Threaded { .. } => {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                (MultiSender::new_local(tx), MultiReceiver::new_local(rx))
+            }
+            ConcurrentExecutorInner::Process { mux, .. } => {
+                let (tx, rx) = ipcmux::multi_channel(mux.clone());
+                (MultiSender::new_process(tx), MultiReceiver::new_process(rx))
             }
         }
     }
