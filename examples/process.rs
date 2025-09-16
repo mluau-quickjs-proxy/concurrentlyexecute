@@ -152,10 +152,9 @@ async fn host() {
     }
     println!("Time taken for bulk x10: {:?}", time.elapsed());
 
-    executor.shutdown().unwrap();
-    executor.wait().await.unwrap();
+    executor.shutdown().await.unwrap();
 
-    println!("====== Testing blocking shutdown ======");
+    println!("====== Testing blocking shutdown (this should panic) ======");
     let time = std::time::Instant::now();
     let (tx, rx) = executor.create_oneshot();
     msg_tx.server(ctx).send(MpTaskMessage::AddToTestStruct { s: TestStruct { a: 5, b: "Hello".to_string() }, resp: tx }).unwrap();

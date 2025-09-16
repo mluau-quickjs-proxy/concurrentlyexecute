@@ -131,7 +131,7 @@ pub struct ConcurrentExecutor<T: ConcurrentlyExecute> {
 
 impl<T: ConcurrentlyExecute> Drop for ConcurrentExecutor<T> {
     fn drop(&mut self) {
-        let _ = self.shutdown();
+        let _ = self.shutdown_in_task();
     }
 }
 
@@ -403,7 +403,20 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
     }
 
     /// Shuts down the executor
-    pub fn shutdown(&self) -> Result<(), BaseError> {
+    pub async fn shutdown(&self) -> Result<(), BaseError> {
+        // Give some time for the process to exit gracefully
+        let proc_handle = self.inner.proc_handle.clone();
+        self.get_state().cancel_token.cancel();
+        match proc_handle.write().await.kill().await {
+            Ok(_) => {},
+            Err(e) => {
+                eprintln!("Failed to kill process: {}", e);
+            }
+        };    
+        Ok(())
+    }
+
+    pub fn shutdown_in_task(&self) -> Result<(), BaseError> {
         // Give some time for the process to exit gracefully
         let proc_handle = self.inner.proc_handle.clone();
         self.get_state().cancel_token.cancel();
