@@ -1,16 +1,17 @@
 pub(crate) mod ipcmux;
+pub mod channel;
 
 use std::{sync::Arc, time::Duration};
 
 use futures_util::StreamExt;
 use ipc_channel::ipc::{IpcOneShotServer, IpcSender};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tokio::{runtime::{LocalOptions}, sync::{mpsc::{UnboundedReceiver, UnboundedSender}, OwnedSemaphorePermit, RwLock, Semaphore}};
+use tokio::{runtime::{LocalOptions}, sync::{mpsc::UnboundedReceiver, OwnedSemaphorePermit, RwLock, Semaphore}};
 use tokio_util::sync::CancellationToken;
 use tokio::process::Child;
 
 use crate::ipcmux::IpcMessage;
-pub use crate::ipcmux::ClientContext;
+pub use crate::channel::{ClientContext, OneshotSender, OneshotReceiver, MultiSender, MultiReceiver};
 
 pub type BaseError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -62,222 +63,6 @@ impl ProcessOpts {
     pub fn with_debug_print(mut self, debug: bool) -> Self {
         self.debug_print = debug;
         self
-    }
-}
-
-/// A oneshot sender that can be either local or process
-/// 
-/// This should be used in place of tokio oneshot/remoc directly
-pub enum OneshotSender<T> {
-    Local {
-        sender: tokio::sync::oneshot::Sender<T>,
-    },
-    Process {
-        sender: ipcmux::OneshotSender<T>
-    },
-}
-
-impl<T: Serialize + DeserializeOwned + Send + 'static> OneshotSender<T> {
-    /// Creates a new local oneshot sender
-    pub fn new_local(sender: tokio::sync::oneshot::Sender<T>) -> Self {
-        Self::Local { sender }
-    }
-
-    /// Creates a new process oneshot sender
-    pub fn new_process(sender: ipcmux::OneshotSender<T>) -> Self {
-        Self::Process { sender }
-    }
-
-    /// Sends a value through the oneshot sender
-    pub fn send(self, ctx: &ClientContext, value: T) -> Result<(), BaseError> {
-        match self {
-            Self::Local { sender } => {
-                let _ = sender.send(value);
-            }
-            Self::Process { sender } => {
-                match sender.upgrade(ctx).send(value) {
-                    Ok(_) => {},
-                    Err(e) => {
-                        return Err(format!("Failed to send value through process oneshot sender: {}", e.to_string()).into());
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-impl<T: Serialize + DeserializeOwned + Send + 'static> Serialize for OneshotSender<T> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        match self {
-            Self::Local { .. } => {
-                Err(serde::ser::Error::custom("Cannot serialize local oneshot sender"))
-            }
-            Self::Process { sender } => {
-                // Serialize as [0, sender]
-                sender.serialize(serializer)
-            }
-        }
-    }
-}
-
-impl<'de, T: Serialize + DeserializeOwned + Send + 'static> Deserialize<'de> for OneshotSender<T> {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let sender = ipcmux::OneshotSender::<T>::deserialize(deserializer)?;
-        Ok(Self::Process { sender })
-    }
-}
-
-pub enum OneshotReceiver<T> {
-    Local {
-        receiver: tokio::sync::oneshot::Receiver<T>,
-    },
-    Process {
-        receiver: ipcmux::OneshotReceiver<T>,
-    },
-}
-
-impl<T: Serialize + DeserializeOwned + Send + 'static> OneshotReceiver<T> {
-    /// Creates a new local oneshot receiver
-    pub fn new_local(receiver: tokio::sync::oneshot::Receiver<T>) -> Self {
-        Self::Local { receiver }
-    }
-
-    /// Creates a new process oneshot receiver
-    pub fn new_process(receiver: ipcmux::OneshotReceiver<T>) -> Self {
-        Self::Process { receiver }
-    }
-
-    /// Receives a value from the oneshot receiver
-    pub async fn recv(self) -> Result<T, BaseError> {
-        match self {
-            Self::Local { receiver } => {
-                match receiver.await {
-                    Ok(value) => Ok(value),
-                    Err(e) => Err(format!("Failed to receive value from local oneshot receiver: {}", e.to_string()).into()),
-                }
-            }
-            Self::Process { receiver } => {
-                match receiver.recv().await {
-                    Ok(value) => Ok(value),
-                    Err(e) => Err(format!("Failed to receive value from process oneshot receiver: {}", e.to_string()).into()),
-                }
-            }
-        }
-    }
-}
-
-/// A oneshot sender that can be either local or process
-/// 
-/// This should be used in place of tokio oneshot/remoc directly
-pub enum MultiSender<T> {
-    Local {
-        sender: tokio::sync::mpsc::UnboundedSender<T>,
-    },
-    Process {
-        sender: ipcmux::MultiSender<T>
-    },
-}
-
-impl<T: Serialize + DeserializeOwned + Send + 'static> MultiSender<T> {
-    /// Creates a new local oneshot sender
-    pub fn new_local(sender: tokio::sync::mpsc::UnboundedSender<T>) -> Self {
-        Self::Local { sender }
-    }
-
-    /// Creates a new process multi sender
-    pub fn new_process(sender: ipcmux::MultiSender<T>) -> Self {
-        Self::Process { sender }
-    }
-
-    /// Sends a value through the multi sender
-    pub fn send(&self, ctx: &ClientContext, value: T) -> Result<(), BaseError> {
-        match self {
-            Self::Local { sender } => {
-                let _ = sender.send(value);
-            }
-            Self::Process { sender } => {
-                match sender.upgrade(ctx).send(value) {
-                    Ok(_) => {},
-                    Err(e) => {
-                        return Err(format!("Failed to send value through process oneshot sender: {}", e.to_string()).into());
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-impl<T: Serialize + DeserializeOwned + Send + 'static> Serialize for MultiSender<T> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        match self {
-            Self::Local { .. } => {
-                Err(serde::ser::Error::custom("Cannot serialize local oneshot sender"))
-            }
-            Self::Process { sender } => {
-                // Serialize as [0, sender]
-                sender.serialize(serializer)
-            }
-        }
-    }
-}
-
-impl<'de, T: Serialize + DeserializeOwned + Send + 'static> Deserialize<'de> for MultiSender<T> {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let sender = ipcmux::MultiSender::<T>::deserialize(deserializer)?;
-        Ok(Self::Process { sender })
-    }
-}
-
-pub enum MultiReceiver<T> {
-    Local {
-        receiver: tokio::sync::mpsc::UnboundedReceiver<T>,
-    },
-    Process {
-        receiver: ipcmux::MultiReceiver<T>,
-    },
-}
-
-impl<T: Serialize + DeserializeOwned + Send + 'static> MultiReceiver<T> {
-    /// Creates a new local multi receiver
-    pub fn new_local(receiver: tokio::sync::mpsc::UnboundedReceiver<T>) -> Self {
-        Self::Local { receiver }
-    }
-
-    /// Creates a new process multi receiver
-    pub fn new_process(receiver: ipcmux::MultiReceiver<T>) -> Self {
-        Self::Process { receiver }
-    }
-
-    /// Receives a value from the multi receiver
-    pub async fn recv(&mut self) -> Result<T, BaseError> {
-        match self {
-            Self::Local { receiver } => {
-                match receiver.recv().await {
-                    Some(value) => Ok(value),
-                    None => Err("MultiReceiver channel closed".into()),
-                }
-            }
-            Self::Process { receiver } => {
-                match receiver.recv().await {
-                    Ok(value) => Ok(value),
-                    Err(e) => Err(format!("Failed to receive value from process oneshot receiver: {}", e.to_string()).into()),
-                }
-            }
-        }
     }
 }
 
@@ -347,29 +132,17 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutorState<T> {
 }
 
 /// Internal enum to store the server state of the executor
-enum ConcurrentExecutorInner<T: ConcurrentlyExecute> {
-    Local {
-        state: ConcurrentExecutorState<T>,
-        message_tx: UnboundedSender<Message<T>>,
-        permit: OwnedSemaphorePermit,
-    },
-    Threaded {
-        state: ConcurrentExecutorState<T>,
-        message_tx: UnboundedSender<Message<T>>,
-        permit: OwnedSemaphorePermit,
-    },
-    Process {
-        state: ConcurrentExecutorState<T>,
-        proc_handle: Arc<RwLock<Child>>,
-        permit: OwnedSemaphorePermit,
+struct ConcurrentExecutorInner<T: ConcurrentlyExecute> {
+    state: ConcurrentExecutorState<T>,
+    proc_handle: Arc<RwLock<Child>>,
+    permit: OwnedSemaphorePermit,
 
-        // Sends IpcMessage to the child via ipcmux
-        //
-        // The server will also spawn a task to listen for messages from the child
-        // which is a IpcReceiver<IpcMessage>
-        mux: ipcmux::IpcMux,
-        tx: IpcSender<ProcessMessage<T>>, // Option to enable sending an initial None message
-    },
+    // Sends IpcMessage to the child via ipcmux
+    //
+    // The server will also spawn a task to listen for messages from the child
+    // which is a IpcReceiver<IpcMessage>
+    mux: ipcmux::IpcMux,
+    tx: IpcSender<ProcessMessage<T>>, // Option to enable sending an initial None message
 }
 
 /// Concurrent tokio execution
@@ -386,64 +159,9 @@ impl<T: ConcurrentlyExecute> Drop for ConcurrentExecutor<T> {
 }
 
 impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
-    /// Creates a new local concurrent executor
-    /// that runs in the current thread
-    /// 
-    /// Asserts that it is being used in a local tokio runtime or LocalSet
-    pub async fn new_local(
-        cs_state: ConcurrentExecutorState<T>,
-        initial_data: T::BootstrapData,
-    ) -> Result<Self, BaseError> {
-        let permit = cs_state.sema.clone().acquire_owned().await?;
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        
-        tokio::task::spawn_local(async move {
-            T::run(rx, initial_data, ClientContext { chan:None }).await;
-        });
-
-        Ok(ConcurrentExecutor { 
-            inner: ConcurrentExecutorInner::Local {
-                state: cs_state,
-                message_tx: tx,
-                permit,
-            }
-        })
-    }
-
-    /// Creates a new threaded concurrent executor
-    /// that runs in a separate thread
-    pub async fn new_threaded(
-        cs_state: ConcurrentExecutorState<T>,
-        initial_data: T::BootstrapData,
-    ) -> Result<Self, BaseError> {
-        let permit = cs_state.sema.clone().acquire_owned().await?;
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create tokio runtime");
-            runtime.block_on(async move {
-                let _ = start_tx.send(());
-                T::run(rx, initial_data, ClientContext { chan:None }).await;
-            });
-        });
-        // Wait for the thread to start
-        let _waited = start_rx.await?;
-
-        Ok(ConcurrentExecutor { 
-            inner: ConcurrentExecutorInner::Threaded {
-                state: cs_state,
-                message_tx: tx,
-                permit,
-            }
-        })
-    }
-
     /// Creates a new process concurrent executor
     /// that runs in a separate process
-    pub async fn new_process(
+    pub async fn new(
         cs_state: ConcurrentExecutorState<T>,
         mut opts: ProcessOpts,
         initial_data: impl FnOnce(&Self) -> T::BootstrapData + Send + 'static,
@@ -547,7 +265,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
                 let ntx: IpcSender<ProcessMessage<T>> = ipc_channel::ipc::IpcSender::connect(msg.name).unwrap();
                 
                 let cei = ConcurrentExecutor {
-                    inner: ConcurrentExecutorInner::Process {
+                    inner: ConcurrentExecutorInner {
                         state: cs_state.clone(),
                         proc_handle: Arc::new(RwLock::new(proc_handle)),
                         permit,
@@ -573,14 +291,8 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
             Err(_) => return Err("Timed out waiting for IPC connection from child process".into()),
         };
 
-        let ipcmux_ref = match &cei.inner {
-            ConcurrentExecutorInner::Process { mux, .. } => mux.clone(),
-            _ => unreachable!(),
-        };
-        let ctoken = match &cei.inner {
-            ConcurrentExecutorInner::Process { state, .. } => state.cancel_token.clone(),
-            _ => unreachable!(),
-        };
+        let ipcmux_ref = cei.inner.mux.clone();
+        let ctoken = cei.inner.state.cancel_token.clone();
         tokio::task::spawn(async move {
             ipcmux_ref.run(rx.to_stream(), ctoken).await;
         });
@@ -692,52 +404,34 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
             println!("Starting run function");
         }
 
-        T::run(msgrx, initial_data, ClientContext { chan: Some(tx_ipcmux) }).await;
+        T::run(msgrx, initial_data, ClientContext { chan: tx_ipcmux }).await;
         cancel_token.cancel();
     }
 
     /// Gets the state of the executor
     pub fn get_state(&self) -> &ConcurrentExecutorState<T> {
-        match &self.inner {
-            ConcurrentExecutorInner::Local { state, .. } => &state,
-            ConcurrentExecutorInner::Threaded { state, .. } => &state,
-            ConcurrentExecutorInner::Process { state, .. } => &state,
-        }
+        &self.inner.state
     }
 
     /// Returns the owned permit
     pub fn get_permit(&self) -> &OwnedSemaphorePermit {
-        match &self.inner {
-            ConcurrentExecutorInner::Local { permit, .. } |
-            ConcurrentExecutorInner::Threaded { permit, .. } |
-            ConcurrentExecutorInner::Process { permit, .. } => permit,
-        }
+        &self.inner.permit
     }
 
     /// Returns the owned permit as a mutable reference
     pub fn get_permit_mut(&mut self) -> &mut OwnedSemaphorePermit {
-        match &mut self.inner {
-            ConcurrentExecutorInner::Local { permit, .. } |
-            ConcurrentExecutorInner::Threaded { permit, .. } |
-            ConcurrentExecutorInner::Process { permit, .. } => permit,
-        }
+        &mut self.inner.permit
     }
 
     /// Sends a message to the executor
     pub fn send_raw(&self, msg: Message<T>) -> Result<(), BaseError> {
-        match &self.inner {
-            ConcurrentExecutorInner::Local { message_tx, .. } | ConcurrentExecutorInner::Threaded { message_tx, ..} => {
-                message_tx.send(msg)?;
+        match self.inner.tx.send(ProcessMessage::Message { data: msg }) {
+            Ok(_) => {},
+            Err(e) => {
+                return Err(format!("Failed to send message to process executor: {}", e.to_string()).into());
             }
-            ConcurrentExecutorInner::Process { tx, .. } => {
-                match tx.send(ProcessMessage::Message { data: msg }) {
-                    Ok(_) => {},
-                    Err(e) => {
-                        return Err(format!("Failed to send message to process executor: {}", e.to_string()).into());
-                    }
-                };
-            }
-        }
+        };
+
         Ok(())
     }
 
@@ -750,86 +444,52 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
     /// according to the type of executor
     /// 
     /// This should replace all use of tokio::sync::oneshot::channel function
-    pub fn create_oneshot<U: Serialize + DeserializeOwned + Send + 'static>(&self) -> (OneshotSender<U>, OneshotReceiver<U>) {
-        match &self.inner {
-            ConcurrentExecutorInner::Local { .. } | ConcurrentExecutorInner::Threaded { .. } => {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                (OneshotSender::new_local(tx), OneshotReceiver::new_local(rx))
-            }
-            ConcurrentExecutorInner::Process { mux, .. } => {
-                let (tx, rx) = ipcmux::channel(mux.clone());
-                (OneshotSender::new_process(tx), OneshotReceiver::new_process(rx))
-            }
-        }
+    pub fn create_oneshot<U: Serialize + DeserializeOwned + Send + 'static>(&self) -> (channel::OneshotSender<U>, channel::OneshotReceiver<U>) {
+        let (tx, rx) = channel::channel(self.inner.mux.clone());
+        (tx, rx)
     }    
     
     /// Creates a new oneshot sender/receiver pair
     /// according to the type of executor
     /// 
     /// This should replace all use of tokio::sync::oneshot::channel function
-    pub fn create_multi<U: Serialize + DeserializeOwned + Send + 'static>(&self) -> (MultiSender<U>, MultiReceiver<U>) {
-        match &self.inner {
-            ConcurrentExecutorInner::Local { .. } | ConcurrentExecutorInner::Threaded { .. } => {
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                (MultiSender::new_local(tx), MultiReceiver::new_local(rx))
-            }
-            ConcurrentExecutorInner::Process { mux, .. } => {
-                let (tx, rx) = ipcmux::multi_channel(mux.clone());
-                (MultiSender::new_process(tx), MultiReceiver::new_process(rx))
-            }
-        }
+    pub fn create_multi<U: Serialize + DeserializeOwned + Send + 'static>(&self) -> (channel::MultiSender<U>, channel::MultiReceiver<U>) {
+        let (tx, rx) = channel::multi_channel(self.inner.mux.clone());
+        (tx, rx)
     }
 
-    /// Waits for the executor to finish executing(?)
+    /// Waits for the executor to finish executing
     pub async fn wait(&self) -> Result<(), BaseError> {
-        match &self.inner {
-            ConcurrentExecutorInner::Local { .. } | ConcurrentExecutorInner::Threaded { .. } => {
-                // Local executors run in the background, so we just wait for the cancel token
-                self.get_state().cancel_token.cancelled().await;
+        let proc_handle = self.inner.proc_handle.clone();
+        let cancel_token = self.get_state().cancel_token.clone();
+        let fut = async move {
+            let mut r = proc_handle.write().await;
+            tokio::select! {
+                _ = cancel_token.cancelled() => {}
+                _ = r.wait() => {
+                    // Cancel the token
+                    cancel_token.cancel();
+                }
             }
-            ConcurrentExecutorInner::Process { proc_handle, .. } => {
-                let proc_handle = proc_handle.clone();
-                let cancel_token = self.get_state().cancel_token.clone();
-                let fut = async move {
-                    let mut r = proc_handle.write().await;
-                    tokio::select! {
-                        _ = cancel_token.cancelled() => {}
-                        _ = r.wait() => {
-                            // Cancel the token
-                            cancel_token.cancel();
-                        }
-                    }
-                };
-                fut.await;
-            }
-        }
+        };
+        fut.await;
         Ok(())
     }
 
     /// Shuts down the executor
     pub fn shutdown(&self) -> Result<(), BaseError> {
-        let _ = self.send_raw(Message::Shutdown);
-        match &self.inner {
-            ConcurrentExecutorInner::Local { .. } | ConcurrentExecutorInner::Threaded { .. } => {
-                self.get_state().cancel_token.cancel();
-            }
-            ConcurrentExecutorInner::Process { proc_handle, .. } => {
-                // Give some time for the process to exit gracefully
-                let proc_handle = proc_handle.clone();
-                self.get_state().cancel_token.cancel();
-                let fut = async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    // If the process is still running, kill it
-                    match proc_handle.write().await.kill().await {
-                        Ok(_) => {},
-                        Err(e) => {
-                            eprintln!("Failed to kill process: {}", e);
-                        }
-                    };    
-                };
-                tokio::task::spawn(fut);
-            }
-        }
+        // Give some time for the process to exit gracefully
+        let proc_handle = self.inner.proc_handle.clone();
+        self.get_state().cancel_token.cancel();
+        let fut = async move {
+            match proc_handle.write().await.kill().await {
+                Ok(_) => {},
+                Err(e) => {
+                    eprintln!("Failed to kill process: {}", e);
+                }
+            };    
+        };
+        tokio::task::spawn(fut);
         Ok(())
     }
 }

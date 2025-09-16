@@ -47,7 +47,7 @@ impl ConcurrentlyExecute for MpTask {
         initial_data: Self::BootstrapData,
         ctx: ClientContext,
     ) {
-        initial_data.1.send(&ctx, initial_data.0 + 10).unwrap();
+        initial_data.1.client(&ctx).send(initial_data.0 + 10).unwrap();
         loop {
             tokio::select! {
                 Some(msg) = rx.recv() => {
@@ -60,19 +60,19 @@ impl ConcurrentlyExecute for MpTask {
                             if msg == "0" {
                                 // Simulate a long task
                                 tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                                let _ = resp.send(&ctx, "Long task done".to_string());
+                                let _ = resp.client(&ctx).send("Long task done".to_string());
                                 continue;
                             }
-                            let _ = resp.send(&ctx, format!("Echo: {}", msg));
+                            let _ = resp.client(&ctx).send(format!("Echo: {}", msg));
                         }
                         concurrentlyexec::Message::Data { data: MpTaskMessage::MultiplyByTen { x, resp } } => {
-                            let _ = resp.send(&ctx, x * 10);
+                            let _ = resp.client(&ctx).send(x * 10);
                         }
                         concurrentlyexec::Message::Data { data: MpTaskMessage::AddToTestStruct { s, resp } } => {
                             let mut ns = s;
                             ns.a += 10;
                             ns.b = format!("{} (modified)", ns.b);
-                            let _ = resp.send(&ctx, ns);
+                            let _ = resp.client(&ctx).send(ns);
                         }
                     }
                 }
@@ -88,7 +88,7 @@ async fn host() {
     let state = ConcurrentExecutorState::new(1);
     let rx = Arc::new(RwLock::new(None)); // This will store the initial response receiver
     let rx_ref = rx.clone();
-    let executor = ConcurrentExecutor::<MpTask>::new_process(
+    let executor = ConcurrentExecutor::<MpTask>::new(
         state, 
         ProcessOpts::new(vec!["-".to_string(), "--child".to_string()]),
         move |cei| {
