@@ -138,11 +138,11 @@ impl<T: ConcurrentlyExecute> Drop for ConcurrentExecutor<T> {
 impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
     /// Creates a new process concurrent executor
     /// that runs in a separate process
-    pub async fn new(
+    pub async fn new<Return: Send + 'static>(
         cs_state: ConcurrentExecutorState<T>,
         mut opts: ProcessOpts,
-        initial_data: impl FnOnce(&Self) -> T::BootstrapData + Send + 'static,
-    ) -> Result<Self, BaseError> {
+        initial_data: impl FnOnce(&Self) -> (T::BootstrapData, Return) + Send + 'static,
+    ) -> Result<(Self, Return), BaseError> {
         let debug_print = opts.debug_print;
         let permit = cs_state.sema.clone().acquire_owned().await?;
 
@@ -252,7 +252,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
                         },
                     }
                 };
-                let initial_data = initial_data(&cei);
+                let (initial_data, ret) = initial_data(&cei);
                 let msg = ipcmux::IpcMessage::new(ipcmux::IPC_BOOTSTRAP_DATA_ID, false, &initial_data).unwrap();
                 ntx.send(msg).unwrap(); // Send initial data to establish the connection
                 
@@ -261,11 +261,11 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
                 }
 
                 // Send the IpcSender back to the main
-                let _ = tx.send((rx, cei));
+                let _ = tx.send((rx, cei, ret));
             });
         });
 
-        let (rx, cei) = match tokio::time::timeout(opts.start_timeout, rx).await {
+        let (rx, cei, ret) = match tokio::time::timeout(opts.start_timeout, rx).await {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(format!("Failed to receive IPC connection from child process: {}", e.to_string()).into()),
             Err(_) => return Err("Timed out waiting for IPC connection from child process".into()),
@@ -277,7 +277,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
             ipcmux_ref.run(rx.to_stream(), ctoken).await;
         });
 
-        Ok(cei)
+        Ok((cei,ret))
     }
 
     /// Starts up a process client

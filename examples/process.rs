@@ -1,6 +1,3 @@
-use std::sync::Arc;
-use std::sync::RwLock;
-
 use concurrentlyexec::ClientContext;
 use concurrentlyexec::ConcurrentExecutor;
 use concurrentlyexec::ConcurrentExecutorState;
@@ -87,19 +84,15 @@ impl ConcurrentlyExecute for MpTask {
 
 async fn host() {
     let state = ConcurrentExecutorState::new(1);
-    let rx = Arc::new(RwLock::new(None)); // This will store the initial response receiver
-    let rx_ref = rx.clone();
-    let executor = ConcurrentExecutor::<MpTask>::new(
+    let (executor, rx) = ConcurrentExecutor::<MpTask>::new(
         state, 
         ProcessOpts::new(vec!["-".to_string(), "--child".to_string()]),
         move |cei| {
-            let (tx, rx_inner) = cei.create_oneshot();
-            *rx_ref.write().unwrap() = Some(rx_inner);
-            (42, tx)
+            let (tx, rx) = cei.create_oneshot();
+            ((42, tx), rx)
         }
     ).await.unwrap();
     let ctx = executor.server_context();
-    let rx = rx.write().unwrap().take().unwrap();
     let msg_tx = rx.recv().await.unwrap();
     println!("Got initial response from child: {:?}", msg_tx);
     let (tx, rx) = executor.create_oneshot();
