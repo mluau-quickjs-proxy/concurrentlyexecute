@@ -5,6 +5,7 @@ use concurrentlyexec::ClientContext;
 use concurrentlyexec::ConcurrentExecutor;
 use concurrentlyexec::ConcurrentExecutorState;
 use concurrentlyexec::ConcurrentlyExecute;
+use concurrentlyexec::MultiSender;
 use concurrentlyexec::OneshotSender;
 use concurrentlyexec::ProcessOpts;
 use serde::Deserialize;
@@ -12,13 +13,13 @@ use serde::Serialize;
 use tokio::runtime::LocalOptions;
 use tokio::runtime::Builder;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct TestStruct {
     a: u32,
     b: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 enum MpTaskMessage {
     Request {
         msg: String, // Some string from the server
@@ -32,6 +33,7 @@ enum MpTaskMessage {
         s: TestStruct,
         resp: concurrentlyexec::OneshotSender<TestStruct>,
     },
+    Shutdown,
 }
 
 // A really dumb task
@@ -39,23 +41,22 @@ enum MpTaskMessage {
 struct MpTask {}
 
 impl ConcurrentlyExecute for MpTask {
-    type Message = MpTaskMessage;
-    type BootstrapData = (i32, OneshotSender<i32>); 
+    type BootstrapData = (i32, OneshotSender<MultiSender<MpTaskMessage>>); 
 
     async fn run(
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<concurrentlyexec::Message<Self>>, 
         initial_data: Self::BootstrapData,
         ctx: ClientContext,
     ) {
-        initial_data.1.client(&ctx).send(initial_data.0 + 10).unwrap();
+        let (tx, mut rx) = ctx.multi();
+        initial_data.1.client(&ctx).send(tx).unwrap();
         loop {
             tokio::select! {
-                Some(msg) = rx.recv() => {
+                Ok(msg) = rx.recv() => {
                     match msg {
-                        concurrentlyexec::Message::Shutdown => {
+                        MpTaskMessage::Shutdown => {
                             break;
                         }
-                        concurrentlyexec::Message::Data { data: MpTaskMessage::Request { msg, resp } } => {
+                        MpTaskMessage::Request { msg, resp } => {
                             // Just echo the message back
                             if msg == "0" {
                                 // Simulate a long task
@@ -65,10 +66,10 @@ impl ConcurrentlyExecute for MpTask {
                             }
                             let _ = resp.client(&ctx).send(format!("Echo: {}", msg));
                         }
-                        concurrentlyexec::Message::Data { data: MpTaskMessage::MultiplyByTen { x, resp } } => {
+                        MpTaskMessage::MultiplyByTen { x, resp } => {
                             let _ = resp.client(&ctx).send(x * 10);
                         }
-                        concurrentlyexec::Message::Data { data: MpTaskMessage::AddToTestStruct { s, resp } } => {
+                        MpTaskMessage::AddToTestStruct { s, resp } => {
                             let mut ns = s;
                             ns.a += 10;
                             ns.b = format!("{} (modified)", ns.b);
@@ -97,13 +98,13 @@ async fn host() {
             (42, tx)
         }
     ).await.unwrap();
+    let ctx = executor.server_context();
     let rx = rx.write().unwrap().take().unwrap();
-    let initial_response = rx.recv().await.unwrap();
-    assert!(initial_response == 52);
-    println!("Got initial response from child: {}", initial_response);
+    let msg_tx = rx.recv().await.unwrap();
+    println!("Got initial response from child: {:?}", msg_tx);
     let (tx, rx) = executor.create_oneshot();
     let time = std::time::Instant::now();
-    executor.send(MpTaskMessage::Request { msg: "Hello from host".to_string(), resp: tx }).unwrap();
+    msg_tx.server(ctx).send(MpTaskMessage::Request { msg: "Hello from host".to_string(), resp: tx }).unwrap();
     println!("Time taken [send]: {:?}", time.elapsed());
     let response = rx.recv().await.unwrap();
     println!("Time taken: {:?}", time.elapsed());
@@ -111,7 +112,7 @@ async fn host() {
 
     let time = std::time::Instant::now();
     let (tx, rx) = executor.create_oneshot();
-    executor.send(MpTaskMessage::Request { msg: "Hello from host 2".to_string(), resp: tx }).unwrap();
+    msg_tx.server(ctx).send(MpTaskMessage::Request { msg: "Hello from host 2".to_string(), resp: tx }).unwrap();
     println!("Time taken [send]: {:?}", time.elapsed());
     let response = rx.recv().await.unwrap();
     println!("Time taken: {:?}", time.elapsed());
@@ -120,7 +121,7 @@ async fn host() {
     println!("====== Starting x10 ======");
     let time = std::time::Instant::now();
     let (tx, rx) = executor.create_oneshot();
-    executor.send(MpTaskMessage::MultiplyByTen { x: 5, resp: tx }).unwrap();
+    msg_tx.server(ctx).send(MpTaskMessage::MultiplyByTen { x: 5, resp: tx }).unwrap();
     println!("Time taken [send]: {:?}", time.elapsed());
     let response = rx.recv().await.unwrap();
     println!("Time taken: {:?}", time.elapsed());
@@ -132,7 +133,7 @@ async fn host() {
     println!("====== Starting long task ======");
     let time = std::time::Instant::now();
     let (tx, rx) = executor.create_oneshot();
-    executor.send(MpTaskMessage::Request { msg: "0".to_string(), resp: tx }).unwrap();
+    msg_tx.server(ctx).send(MpTaskMessage::Request { msg: "0".to_string(), resp: tx }).unwrap();
     println!("Time taken [send]: {:?}", time.elapsed());
     let response = rx.recv().await.unwrap();
     println!("Time taken: {:?}", time.elapsed());
@@ -141,7 +142,7 @@ async fn host() {
     println!("====== Starting TestStruct modification ======");
     let time = std::time::Instant::now();
     let (tx, rx) = executor.create_oneshot();
-    executor.send(MpTaskMessage::AddToTestStruct { s: TestStruct { a: 5, b: "Hello".to_string() }, resp: tx }).unwrap();
+    msg_tx.server(ctx).send(MpTaskMessage::AddToTestStruct { s: TestStruct { a: 5, b: "Hello".to_string() }, resp: tx }).unwrap();
     println!("Time taken [send]: {:?}", time.elapsed());
     let response = rx.recv().await.unwrap();
     println!("Time taken: {:?}", time.elapsed());
@@ -152,7 +153,7 @@ async fn host() {
     let time = std::time::Instant::now();
     for i in 1..10000 {
         let (tx, rx) = executor.create_oneshot();
-        executor.send(MpTaskMessage::MultiplyByTen { x: i, resp: tx }).unwrap();
+        msg_tx.server(ctx).send(MpTaskMessage::MultiplyByTen { x: i, resp: tx }).unwrap();
         let response = rx.recv().await.unwrap();
         assert!(response == i * 10);
     }
@@ -164,9 +165,9 @@ async fn host() {
     println!("====== Testing blocking shutdown ======");
     let time = std::time::Instant::now();
     let (tx, rx) = executor.create_oneshot();
-    executor.send(MpTaskMessage::AddToTestStruct { s: TestStruct { a: 5, b: "Hello".to_string() }, resp: tx }).unwrap();
+    msg_tx.server(ctx).send(MpTaskMessage::AddToTestStruct { s: TestStruct { a: 5, b: "Hello".to_string() }, resp: tx }).unwrap();
     let (tx, _rx) = executor.create_oneshot();
-    executor.send(MpTaskMessage::AddToTestStruct { s: TestStruct { a: 5, b: "Hello".to_string() }, resp: tx }).unwrap();
+    msg_tx.server(ctx).send(MpTaskMessage::AddToTestStruct { s: TestStruct { a: 5, b: "Hello".to_string() }, resp: tx }).unwrap();
     println!("Time taken [send]: {:?}", time.elapsed());
     let response = tokio::time::timeout(
         tokio::time::Duration::from_secs(5),

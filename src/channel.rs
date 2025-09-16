@@ -2,13 +2,30 @@ use tokio::sync::{mpsc::UnboundedReceiver, oneshot::{Receiver}};
 use crate::{ipcmux::{IpcMessage, IpcMux}, BaseError};
 use serde::{Serialize, Deserialize};
 
-
 #[derive(Clone)]
-pub struct ClientContext {
+pub struct ServerContext {
     pub(crate) chan: ipc_channel::ipc::IpcSender<IpcMessage>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone)]
+pub struct ClientContext {
+    pub(crate) _mux: IpcMux,
+    pub(crate) chan: ipc_channel::ipc::IpcSender<IpcMessage>,
+}
+
+impl ClientContext {
+    /// Creates a new oneshot channel
+    pub fn oneshot<T: for<'de> Deserialize<'de> + Serialize>(&self) -> (OneshotSender<T>, OneshotReceiver<T>) {
+        channel(self._mux.clone())
+    }
+
+    /// Creates a new multi channel
+    pub fn multi<T: for<'de> Deserialize<'de> + Serialize>(&self) -> (MultiSender<T>, MultiReceiver<T>) {
+        multi_channel(self._mux.clone())
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(bound = "")]
 pub struct OneshotSender<T> {
     id: u64,
@@ -26,9 +43,20 @@ impl<T: Serialize> OneshotSender<T> {
 
         }
     }
+
+    /// Upgrades a oneshot sender to a ServerOneShotSender which can be used from a server process
+    pub fn server(self, ctx: &ServerContext) -> ServerOneShotSender<T> {
+        let chan = ctx.chan.clone();
+        ServerOneShotSender {
+            id: self.id,
+            chan,
+            _marker: self._marker
+
+        }
+    }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(bound = "")]
 pub struct MultiSender<T> {
     id: u64,
@@ -46,6 +74,16 @@ impl<T: Serialize> MultiSender<T> {
 
         }
     }
+
+    /// Upgrades a sender to a ServerMulti which can be used from a server process
+    pub fn server(&self, ctx: &ServerContext) -> ServerMultiSender<T> {
+        let chan = ctx.chan.clone();
+        ServerMultiSender {
+            id: self.id,
+            chan,
+            _marker: self._marker
+        }
+    }
 }
 
 /// A oneshot sender can only send messages from a client process
@@ -61,11 +99,25 @@ pub struct ClientOneShotSender<T> {
 impl<T: Serialize> ClientOneShotSender<T> {
     /// Sends a message to the given oneshot channel
     pub fn send(self, data: T) -> Result<(), BaseError> {
-        let msg = IpcMessage {
-            id: self.id,
-            mpsc: false,
-            data: serde_bytes::ByteBuf::from(bincode::serde::encode_to_vec(data, bincode::config::standard())?),
-        };
+        let msg = IpcMessage::new(self.id, false, &data)?;
+        Ok(self.chan.send(msg)?)
+    }
+}
+
+/// A oneshot sender can only send messages from a client process
+/// 
+/// In order to ensure this (and get the send connection from the client),
+/// this struct acts as a intermediary to allow sending
+pub struct ServerOneShotSender<T> {
+    id: u64,
+    chan: ipc_channel::ipc::IpcSender<IpcMessage>,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<T: Serialize> ServerOneShotSender<T> {
+    /// Sends a message to the given oneshot channel
+    pub fn send(self, data: T) -> Result<(), BaseError> {
+        let msg = IpcMessage::new(self.id, false, &data)?;
         Ok(self.chan.send(msg)?)
     }
 }
@@ -83,11 +135,25 @@ pub struct ClientMultiSender<T> {
 impl<T: Serialize> ClientMultiSender<T> {
     /// Sends a message to the given oneshot channel
     pub fn send(&self, data: T) -> Result<(), BaseError> {
-        let msg = IpcMessage {
-            id: self.id,
-            mpsc: true,
-            data: serde_bytes::ByteBuf::from(bincode::serde::encode_to_vec(data, bincode::config::standard())?),
-        };
+        let msg = IpcMessage::new(self.id, true, &data)?;
+        Ok(self.chan.send(msg)?)
+    }
+}
+
+/// A multi sender can only send messages from a server process
+/// 
+/// In order to ensure this (and get the send connection from the server),
+/// this struct acts as a intermediary to allow sending
+pub struct ServerMultiSender<T> {
+    id: u64,
+    chan: ipc_channel::ipc::IpcSender<IpcMessage>,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<T: Serialize> ServerMultiSender<T> {
+    /// Sends a message to the given oneshot channel
+    pub fn send(&self, data: T) -> Result<(), BaseError> {
+        let msg = IpcMessage::new(self.id, true, &data)?;
         Ok(self.chan.send(msg)?)
     }
 }

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use crate::BaseError;
 
 pub const IPC_BOOTSTRAP_ID: u64 = 1292;
+pub const IPC_BOOTSTRAP_DATA_ID: u64 = 1293;
 
 #[derive(Default)]
 struct IpcMuxMap {
@@ -36,13 +37,22 @@ pub(crate) struct IpcMessage {
 }
 
 impl IpcMessage {
+    pub fn new<T: Serialize>(id: u64, mpsc: bool, data: &T) -> Result<Self, BaseError> {
+        let data = bincode::serde::encode_to_vec(data, bincode::config::standard())?;
+        Ok(Self {
+            id,
+            mpsc,
+            data: serde_bytes::ByteBuf::from(data),
+        })
+    }
+
     pub fn deserialize<T: for<'de> Deserialize<'de>>(&self) -> Result<T, BaseError> {
         let (data, _) = bincode::serde::decode_from_slice(&self.data, bincode::config::standard())?;
         Ok(data)
     }
 
     pub const fn is_reserved(id: u64) -> bool {
-        id == 0 || id == IPC_BOOTSTRAP_ID
+        id == 0 || id == IPC_BOOTSTRAP_ID || id == IPC_BOOTSTRAP_DATA_ID
     }
 }
 
