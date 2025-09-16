@@ -1,7 +1,11 @@
+use std::sync::Arc;
+use std::sync::RwLock;
+
 use concurrentlyexec::ClientContext;
 use concurrentlyexec::ConcurrentExecutor;
 use concurrentlyexec::ConcurrentExecutorState;
 use concurrentlyexec::ConcurrentlyExecute;
+use concurrentlyexec::OneshotSender;
 use concurrentlyexec::ProcessOpts;
 use serde::Deserialize;
 use serde::Serialize;
@@ -36,11 +40,14 @@ struct MpTask {}
 
 impl ConcurrentlyExecute for MpTask {
     type Message = MpTaskMessage;
+    type BootstrapData = (i32, OneshotSender<i32>); 
 
     async fn run(
         mut rx: tokio::sync::mpsc::UnboundedReceiver<concurrentlyexec::Message<Self>>, 
+        initial_data: Self::BootstrapData,
         ctx: ClientContext,
     ) {
+        initial_data.1.send(&ctx, initial_data.0 + 10).unwrap();
         loop {
             tokio::select! {
                 Some(msg) = rx.recv() => {
@@ -79,7 +86,21 @@ impl ConcurrentlyExecute for MpTask {
 
 async fn host() {
     let state = ConcurrentExecutorState::new(1);
-    let executor = ConcurrentExecutor::<MpTask>::new_process(state, ProcessOpts::new(vec!["-".to_string(), "--child".to_string()])).await.unwrap();
+    let rx = Arc::new(RwLock::new(None)); // This will store the initial response receiver
+    let rx_ref = rx.clone();
+    let executor = ConcurrentExecutor::<MpTask>::new_process(
+        state, 
+        ProcessOpts::new(vec!["-".to_string(), "--child".to_string()]),
+        move |cei| {
+            let (tx, rx_inner) = cei.create_oneshot();
+            *rx_ref.write().unwrap() = Some(rx_inner);
+            (42, tx)
+        }
+    ).await.unwrap();
+    let rx = rx.write().unwrap().take().unwrap();
+    let initial_response = rx.recv().await.unwrap();
+    assert!(initial_response == 52);
+    println!("Got initial response from child: {}", initial_response);
     let (tx, rx) = executor.create_oneshot();
     let time = std::time::Instant::now();
     executor.send(MpTaskMessage::Request { msg: "Hello from host".to_string(), resp: tx }).unwrap();

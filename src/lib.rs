@@ -283,12 +283,12 @@ impl<T: Serialize + DeserializeOwned + Send + 'static> MultiReceiver<T> {
 
 #[derive(Serialize, Deserialize)]
 #[serde(bound = "")]
-pub enum ProcessMessage<T: ConcurrentlyExecute> {
+enum ProcessMessage<T: ConcurrentlyExecute> {
     Message {
         data: Message<T>,
     },
-    CreateServerClientConn {
-        name: String
+    BootstrapData {
+        data: T::BootstrapData,
     }
 }
 
@@ -305,9 +305,11 @@ pub enum Message<T: ConcurrentlyExecute> {
 /// Trait for types that can be executed concurrently
 pub trait ConcurrentlyExecute: Send + Sync + Clone + Sized + 'static {
     type Message: Serialize + for<'a> Deserialize<'a> + Send + Sync + 'static;
+    type BootstrapData: Serialize + for<'a> Deserialize<'a> + Send + Sync + 'static;
 
     async fn run(
         rx: UnboundedReceiver<Message<Self>>, 
+        bootstrap_data: Self::BootstrapData,
         client_ctx: ClientContext
     );
 }
@@ -366,7 +368,7 @@ enum ConcurrentExecutorInner<T: ConcurrentlyExecute> {
         // The server will also spawn a task to listen for messages from the child
         // which is a IpcReceiver<IpcMessage>
         mux: ipcmux::IpcMux,
-        tx: IpcSender<Option<Message<T>>>, // Option to enable sending an initial None message
+        tx: IpcSender<ProcessMessage<T>>, // Option to enable sending an initial None message
     },
 }
 
@@ -390,12 +392,13 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
     /// Asserts that it is being used in a local tokio runtime or LocalSet
     pub async fn new_local(
         cs_state: ConcurrentExecutorState<T>,
+        initial_data: T::BootstrapData,
     ) -> Result<Self, BaseError> {
         let permit = cs_state.sema.clone().acquire_owned().await?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         
         tokio::task::spawn_local(async move {
-            T::run(rx, ClientContext { chan:None }).await;
+            T::run(rx, initial_data, ClientContext { chan:None }).await;
         });
 
         Ok(ConcurrentExecutor { 
@@ -411,6 +414,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
     /// that runs in a separate thread
     pub async fn new_threaded(
         cs_state: ConcurrentExecutorState<T>,
+        initial_data: T::BootstrapData,
     ) -> Result<Self, BaseError> {
         let permit = cs_state.sema.clone().acquire_owned().await?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -422,7 +426,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
                 .expect("Failed to create tokio runtime");
             runtime.block_on(async move {
                 let _ = start_tx.send(());
-                T::run(rx, ClientContext { chan:None }).await;
+                T::run(rx, initial_data, ClientContext { chan:None }).await;
             });
         });
         // Wait for the thread to start
@@ -442,6 +446,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
     pub async fn new_process(
         cs_state: ConcurrentExecutorState<T>,
         mut opts: ProcessOpts,
+        initial_data: impl FnOnce(&Self) -> T::BootstrapData + Send + 'static,
     ) -> Result<Self, BaseError> {
         let debug_print = opts.debug_print;
         let permit = cs_state.sema.clone().acquire_owned().await?;
@@ -539,39 +544,48 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
                 
                 // Deserialize the IpcSender from the message
                 let msg: ipcmux::IpcMuxBootstrap = client_conn_pipe.deserialize().unwrap();
-                let ntx: IpcSender<Option<Message<T>>> = ipc_channel::ipc::IpcSender::connect(msg.name).unwrap();
-                ntx.send(None).unwrap(); // Send an initial None message to establish the connection
+                let ntx: IpcSender<ProcessMessage<T>> = ipc_channel::ipc::IpcSender::connect(msg.name).unwrap();
+                
+                let cei = ConcurrentExecutor {
+                    inner: ConcurrentExecutorInner::Process {
+                        state: cs_state.clone(),
+                        proc_handle: Arc::new(RwLock::new(proc_handle)),
+                        permit,
+                        mux: ipcmux::IpcMux::new(), // Dummy mux for now
+                        tx: ntx.clone()
+                    }
+                };
+                let initial_data = initial_data(&cei);
+                ntx.send(ProcessMessage::BootstrapData { data: initial_data }).unwrap(); // Send an initial None message to establish the connection
                 
                 if debug_print {
                     println!("Connected to child process");
                 }
 
                 // Send the IpcSender back to the main
-                let _ = tx.send((ntx, rx));
+                let _ = tx.send((rx, cei));
             });
         });
-        let (tx, rx) = match tokio::time::timeout(opts.start_timeout, rx).await {
+
+        let (rx, cei) = match tokio::time::timeout(opts.start_timeout, rx).await {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(format!("Failed to receive IPC connection from child process: {}", e.to_string()).into()),
             Err(_) => return Err("Timed out waiting for IPC connection from child process".into()),
         };
 
-        let ipcmux = ipcmux::IpcMux::new();
-        let ipcmux_ref = ipcmux.clone();
-        let ctoken = cs_state.cancel_token.clone();
+        let ipcmux_ref = match &cei.inner {
+            ConcurrentExecutorInner::Process { mux, .. } => mux.clone(),
+            _ => unreachable!(),
+        };
+        let ctoken = match &cei.inner {
+            ConcurrentExecutorInner::Process { state, .. } => state.cancel_token.clone(),
+            _ => unreachable!(),
+        };
         tokio::task::spawn(async move {
             ipcmux_ref.run(rx.to_stream(), ctoken).await;
         });
 
-        Ok(ConcurrentExecutor { 
-            inner: ConcurrentExecutorInner::Process {
-                state: cs_state,
-                proc_handle: Arc::new(RwLock::new(proc_handle)),
-                permit,
-                mux: ipcmux,
-                tx,
-            }
-        })
+        Ok(cei)
     }
 
     /// Starts up a process client
@@ -595,7 +609,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
         }
 
         // Create a second pipe for the server to send messages to the client
-        let (rx, server_conn_pipe) = ipc_channel::ipc::IpcOneShotServer::<Option<Message<T>>>::new().expect("Failed to create IPC oneshot server");
+        let (rx, server_conn_pipe) = ipc_channel::ipc::IpcOneShotServer::<ProcessMessage<T>>::new().expect("Failed to create IPC oneshot server");
         // Send the server the IpcSender to connect to
         let bootstrap = ipcmux::IpcMuxBootstrap { name: server_conn_pipe };
         let msg = IpcMessage {
@@ -618,7 +632,10 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
         let cancel_token = CancellationToken::new();
         let c_token = cancel_token.clone();
         let (msgtx, msgrx) = tokio::sync::mpsc::unbounded_channel::<Message<T>>();
-        assert!(ini_msg.is_none(), "Initial message from server must be None");
+        let initial_data = match ini_msg {
+            ProcessMessage::BootstrapData { data } => data,
+            _ => panic!("Initial message from server must be BootstrapData"),
+        };
         let fut = async move { 
             if debug_print {
                 println!("Starting message forwarding task");
@@ -641,9 +658,17 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
                         let Some(Ok(msg)) = s else {
                             continue;
                         };
-                        let Some(msg) = msg else {
-                            continue;
+
+                        let msg = match msg {
+                            ProcessMessage::Message { data } => data,
+                            ProcessMessage::BootstrapData { .. } => {
+                                if debug_print {
+                                    println!("Received unexpected BootstrapData message from server, ignoring");
+                                }
+                                continue;
+                            }
                         };
+
                         match msg {
                             Message::Data { data } => {
                                 if debug_print {
@@ -667,7 +692,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
             println!("Starting run function");
         }
 
-        T::run(msgrx, ClientContext { chan: Some(tx_ipcmux) }).await;
+        T::run(msgrx, initial_data, ClientContext { chan: Some(tx_ipcmux) }).await;
         cancel_token.cancel();
     }
 
@@ -705,7 +730,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
                 message_tx.send(msg)?;
             }
             ConcurrentExecutorInner::Process { tx, .. } => {
-                match tx.send(Some(msg)) {
+                match tx.send(ProcessMessage::Message { data: msg }) {
                     Ok(_) => {},
                     Err(e) => {
                         return Err(format!("Failed to send message to process executor: {}", e.to_string()).into());
