@@ -63,6 +63,15 @@ pub struct MultiSender<T> {
     _marker: std::marker::PhantomData<T>,
 }
 
+impl<T> Clone for MultiSender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
 impl<T: Serialize> MultiSender<T> {
     /// Upgrades a sender to a ClientMulti which can be used from a client process
     pub fn client(&self, ctx: &ClientContext) -> ClientMultiSender<T> {
