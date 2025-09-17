@@ -7,7 +7,7 @@ edition = "2024"
 ipc-channel = { version = "0.20", features = ["async"] }
 tokio = { version = "1", features = ["full", "process"] }
 tokio-util = "0.7"
-serde = "1"
+serde = { version = "1", features = ["derive"] }
 rand = "0.9"
 futures-util = "0.3"
 serde_bytes = "0.11"
