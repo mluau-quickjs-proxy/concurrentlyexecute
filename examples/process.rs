@@ -158,6 +158,8 @@ async fn host() {
     }
     println!("Time taken for bulk x10: {:?}", time.elapsed());
 
+    println!("DEBUG, PID: {}", executor.child_pid());
+
     // Send panic
     println!("====== Testing panic handling ======");
     let time = std::time::Instant::now();

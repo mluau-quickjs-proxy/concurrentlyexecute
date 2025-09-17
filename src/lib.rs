@@ -24,8 +24,6 @@ pub struct ProcessOpts {
     /// to the parent process
     pub cmd_argv: Vec<String>,
     pub cmd_envs: Vec<(String, String)>,
-    pub mem_soft_limit: i64,
-    pub mem_hard_limit: i64,
     pub start_timeout: Duration,
     pub debug_print: bool,
 }
@@ -35,8 +33,6 @@ impl ProcessOpts {
         Self {
             cmd_argv,
             cmd_envs: vec![],
-            mem_soft_limit: 0,
-            mem_hard_limit: 0,
             start_timeout: Duration::from_secs(10),
             debug_print: false,
         }
@@ -44,12 +40,6 @@ impl ProcessOpts {
 
     pub fn with_envs(mut self, envs: Vec<(String, String)>) -> Self {
         self.cmd_envs = envs;
-        self
-    }
-
-    pub fn with_mem_limits(mut self, soft_limit: i64, hard_limit: i64) -> Self {
-        self.mem_soft_limit = soft_limit;
-        self.mem_hard_limit = hard_limit;
         self
     }
 
@@ -129,6 +119,8 @@ struct ConcurrentExecutorInner<T: ConcurrentlyExecute> {
     // which is a IpcReceiver<IpcMessage>
     mux: ipcmux::IpcMux,
     server_context: ServerContext,
+
+    child_pid: u32,
 }
 
 /// Concurrent tokio execution
@@ -190,44 +182,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
         cmd.kill_on_drop(true);
         let mut proc_handle = cmd.spawn()?;
 
-        // Set cgroups up if on unix and memory limits are set
-        let mut _guard = None;
-        #[cfg(unix)]
-        {
-            struct CgroupWithDtor {
-                _cgroup: cgroups_rs::fs::Cgroup,
-            }
-
-            impl Drop for CgroupWithDtor {
-                fn drop(&mut self) {
-                    match self._cgroup.delete() {
-                        Ok(_) => {},
-                        Err(e) => {
-                            eprintln!("Failed to delete cgroup: {}", e);
-                        }
-                    };
-                }
-            }
-            
-            if opts.mem_hard_limit > 0 || opts.mem_soft_limit > 0 {
-                // Create a cgroup and set memory limits
-                let cg = cgroups_rs::fs::cgroup_builder::CgroupBuilder::new(&format!("ce-{}-{}", std::process::id(), rand::random::<u64>()))
-                .memory()
-                    .memory_soft_limit(opts.mem_soft_limit)
-                    .memory_hard_limit(opts.mem_hard_limit)
-                .done()
-                .build(Box::new(cgroups_rs::fs::hierarchies::V2::new()))
-                .expect("Failed to create cgroup");
-                assert!(cg.exists());
-                cg.add_task(cgroups_rs::CgroupPid::from(proc_handle.id().ok_or("Failed to get child process pid")? as u64))
-                    .expect("Failed to add process to cgroup");
-                _guard = Some(CgroupWithDtor { _cgroup: cg });
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            _guard = Some(()); // Dummy guard
-        }
+        let child_pid = proc_handle.id().unwrap_or(0);
         
         // Wait for a connection
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -260,6 +215,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
                         server_context: ServerContext {
                             chan: ntx.clone(),
                         },
+                        child_pid
                     }
                 };
                 let (initial_data, ret) = initial_data(&cei);
@@ -430,6 +386,11 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
         // Send message to the task to shut down
         let _ = self.inner.shutdown_chan.send(());
         Ok(())
+    }
+
+    /// Returns the PID of the created child
+    pub fn child_pid(&self) -> u32 {
+        self.inner.child_pid
     }
 }
 
