@@ -67,8 +67,8 @@ impl ProcessOpts {
 
 #[allow(async_fn_in_trait)]
 /// Trait for types that can be executed concurrently
-pub trait ConcurrentlyExecute: Send + Sync + Clone + Sized + 'static {
-    type BootstrapData: Serialize + for<'a> Deserialize<'a> + Send + Sync + 'static;
+pub trait ConcurrentlyExecute: Send + Sync + 'static {
+    type BootstrapData: Serialize + for<'a> Deserialize<'a> + 'static;
 
     async fn run(
         bootstrap_data: Self::BootstrapData,
@@ -77,11 +77,21 @@ pub trait ConcurrentlyExecute: Send + Sync + Clone + Sized + 'static {
 }
 
 /// State for a concurrent executor
-#[derive(Clone)]
 pub struct ConcurrentExecutorState<T: ConcurrentlyExecute> {
     pub cancel_token: CancellationToken,
     pub sema: Arc<Semaphore>,
     _marker: std::marker::PhantomData<T>,
+}
+
+// Needed as C
+impl<T: ConcurrentlyExecute> Clone for ConcurrentExecutorState<T> {
+    fn clone(&self) -> Self {
+        Self {
+            cancel_token: self.cancel_token.clone(),
+            sema: self.sema.clone(),
+            _marker: std::marker::PhantomData,
+        }
+    }
 }
 
 impl<T: ConcurrentlyExecute> ConcurrentExecutorState<T> {
