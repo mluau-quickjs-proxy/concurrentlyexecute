@@ -1,4 +1,5 @@
 use tokio::sync::{mpsc::UnboundedReceiver, oneshot::{Receiver}};
+use tokio_util::sync::CancellationToken;
 use crate::{ipcmux::{IpcMessage, IpcMux}, BaseError};
 use serde::{Serialize, Deserialize};
 
@@ -11,17 +12,18 @@ pub struct ServerContext {
 pub struct ClientContext {
     pub(crate) _mux: IpcMux,
     pub(crate) chan: ipc_channel::ipc::IpcSender<IpcMessage>,
+    pub(crate) cancel_token: CancellationToken,
 }
 
 impl ClientContext {
     /// Creates a new oneshot channel
     pub fn oneshot<T: for<'de> Deserialize<'de> + Serialize>(&self) -> (OneshotSender<T>, OneshotReceiver<T>) {
-        channel(self._mux.clone())
+        channel(self._mux.clone(), self.cancel_token.clone())
     }
 
     /// Creates a new multi channel
     pub fn multi<T: for<'de> Deserialize<'de> + Serialize>(&self) -> (MultiSender<T>, MultiReceiver<T>) {
-        multi_channel(self._mux.clone())
+        multi_channel(self._mux.clone(), self.cancel_token.clone())
     }
 }
 
@@ -171,6 +173,7 @@ pub struct OneshotReceiver<T> {
     rx: Option<Receiver<IpcMessage>>,
     id: u64,
     mux: IpcMux,
+    cancel_token: CancellationToken,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -181,8 +184,17 @@ impl<T: for<'de> Deserialize<'de>> OneshotReceiver<T> {
         let Some(rx) = rx else {
             return Err("OneshotReceiver already consumed".into());
         };
-        let resp = rx.await?;
-        resp.deserialize()
+        tokio::select! {
+            _ = self.cancel_token.cancelled() => {
+                Err("OneshotReceiver cancelled [process probably exited]".into())
+            }
+            resp = rx => {
+                match resp {
+                    Ok(msg) => msg.deserialize(),
+                    Err(_) => Err("OneshotReceiver channel closed".into()),
+                }
+            }
+        }
     }
 }
 
@@ -196,16 +208,24 @@ pub struct MultiReceiver<T> {
     rx: UnboundedReceiver<IpcMessage>,
     id: u64,
     mux: IpcMux,
+    cancel_token: CancellationToken,
     _marker: std::marker::PhantomData<T>,
 }
 
 impl<T: for<'de> Deserialize<'de>> MultiReceiver<T> {
     /// Receives a message from the multi channel
     pub async fn recv(&mut self) -> Result<T, BaseError> {
-        let Some(resp) = self.rx.recv().await else {
-            return Err("MultiReceiver channel closed".into());
-        };
-        resp.deserialize()
+        tokio::select! {
+            _ = self.cancel_token.cancelled() => {
+                return Err("MultiReceiver cancelled [process probably exited]".into());
+            }
+            resp = self.rx.recv() => {
+                match resp {
+                    Some(msg) => msg.deserialize(),
+                    None => return Err("MultiReceiver channel closed".into()),
+                }
+            }
+        }
     }
 }
 
@@ -215,7 +235,7 @@ impl<T> Drop for MultiReceiver::<T> {
     }
 }
 
-pub(crate) fn channel<T: for<'de> Deserialize<'de> + Serialize>(mux: IpcMux) -> (OneshotSender<T>, OneshotReceiver<T>) {
+pub(crate) fn channel<T: for<'de> Deserialize<'de> + Serialize>(mux: IpcMux, cancel_token: CancellationToken) -> (OneshotSender<T>, OneshotReceiver<T>) {
     let (id, rx) = mux.register();
     let tx = OneshotSender {
         id,
@@ -225,12 +245,13 @@ pub(crate) fn channel<T: for<'de> Deserialize<'de> + Serialize>(mux: IpcMux) -> 
         id,
         rx: Some(rx),
         mux,
+        cancel_token,
         _marker: std::marker::PhantomData,
     };
     (tx, rx)
 }
 
-pub(crate) fn multi_channel<T: for<'de> Deserialize<'de> + Serialize>(mux: IpcMux) -> (MultiSender<T>, MultiReceiver<T>) {
+pub(crate) fn multi_channel<T: for<'de> Deserialize<'de> + Serialize>(mux: IpcMux, cancel_token: CancellationToken) -> (MultiSender<T>, MultiReceiver<T>) {
     let (id, rx) = mux.register_mpsc();
     let tx = MultiSender {
         id,
@@ -240,6 +261,7 @@ pub(crate) fn multi_channel<T: for<'de> Deserialize<'de> + Serialize>(mux: IpcMu
         id,
         rx,
         mux,
+        cancel_token,
         _marker: std::marker::PhantomData,
     };
     (tx, rx)

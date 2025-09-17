@@ -5,9 +5,8 @@ use std::{sync::Arc, time::Duration};
 
 use ipc_channel::ipc::{IpcOneShotServer, IpcSender};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tokio::{runtime::{LocalOptions}, sync::{OwnedSemaphorePermit, RwLock, Semaphore}};
+use tokio::{runtime::{LocalOptions}, sync::{OwnedSemaphorePermit, Semaphore}};
 use tokio_util::sync::CancellationToken;
-use tokio::process::Child;
 
 use crate::{channel::ServerContext, ipcmux::IpcMessage};
 pub use crate::channel::{ClientContext, OneshotSender, OneshotReceiver, MultiSender, MultiReceiver};
@@ -121,7 +120,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutorState<T> {
 /// Internal enum to store the server state of the executor
 struct ConcurrentExecutorInner<T: ConcurrentlyExecute> {
     state: ConcurrentExecutorState<T>,
-    proc_handle: Arc<RwLock<Child>>,
+    shutdown_chan: tokio::sync::mpsc::UnboundedSender<()>,
     permit: OwnedSemaphorePermit,
 
     // Sends IpcMessage to the child via ipcmux
@@ -189,7 +188,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
         cmd.args(args);
         cmd.envs(env);
         cmd.kill_on_drop(true);
-        let proc_handle = cmd.spawn()?;
+        let mut proc_handle = cmd.spawn()?;
 
         // Set cgroups up if on unix and memory limits are set
         let mut _guard = None;
@@ -231,6 +230,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
         }
         
         // Wait for a connection
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let (tx, rx) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -254,7 +254,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
                 let cei = ConcurrentExecutor {
                     inner: ConcurrentExecutorInner {
                         state: cs_state.clone(),
-                        proc_handle: Arc::new(RwLock::new(proc_handle)),
+                        shutdown_chan: shutdown_tx,
                         permit,
                         mux: ipcmux::IpcMux::new(), // Dummy mux for now
                         server_context: ServerContext {
@@ -285,6 +285,23 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
         let ctoken = cei.inner.state.cancel_token.clone();
         tokio::task::spawn(async move {
             ipcmux_ref.run(rx.to_stream(), ctoken).await;
+        });
+
+        let ctoken = cei.inner.state.cancel_token.clone();
+        tokio::task::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.recv() => {
+                        ctoken.cancel();
+                        break;
+                    }
+                    _ = proc_handle.wait() => {
+                        // Process exited, cancel the token
+                        ctoken.cancel();
+                        break;
+                    }
+                }
+            }
         });
 
         Ok((cei,ret))
@@ -350,7 +367,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
             println!("Starting run function");
         }
 
-        T::run(initial_data, ClientContext { chan: tx_ipcmux, _mux: mux }).await;
+        T::run(initial_data, ClientContext { chan: tx_ipcmux, _mux: mux, cancel_token: cancel_token.clone() }).await;
         cancel_token.cancel();
     }
 
@@ -374,7 +391,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
     /// 
     /// This should replace all use of tokio::sync::oneshot::channel function
     pub fn create_oneshot<U: Serialize + DeserializeOwned + Send + 'static>(&self) -> (channel::OneshotSender<U>, channel::OneshotReceiver<U>) {
-        let (tx, rx) = channel::channel(self.inner.mux.clone());
+        let (tx, rx) = channel::channel(self.inner.mux.clone(), self.inner.state.cancel_token.clone());
         (tx, rx)
     }    
     
@@ -383,7 +400,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
     /// 
     /// This should replace all use of tokio::sync::oneshot::channel function
     pub fn create_multi<U: Serialize + DeserializeOwned + Send + 'static>(&self) -> (channel::MultiSender<U>, channel::MultiReceiver<U>) {
-        let (tx, rx) = channel::multi_channel(self.inner.mux.clone());
+        let (tx, rx) = channel::multi_channel(self.inner.mux.clone(), self.inner.state.cancel_token.clone());
         (tx, rx)
     }
 
@@ -396,49 +413,22 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
 
     /// Waits for the executor to finish executing
     pub async fn wait(&self) -> Result<(), BaseError> {
-        let proc_handle = self.inner.proc_handle.clone();
-        let cancel_token = self.get_state().cancel_token.clone();
-        let fut = async move {
-            let mut r = proc_handle.write().await;
-            tokio::select! {
-                _ = cancel_token.cancelled() => {}
-                _ = r.wait() => {
-                    // Cancel the token
-                    cancel_token.cancel();
-                }
-            }
-        };
-        fut.await;
+        self.get_state().cancel_token.cancelled().await;
         Ok(())
     }
 
     /// Shuts down the executor
     pub async fn shutdown(&self) -> Result<(), BaseError> {
-        // Give some time for the process to exit gracefully
-        let proc_handle = self.inner.proc_handle.clone();
-        self.get_state().cancel_token.cancel();
-        match proc_handle.write().await.kill().await {
-            Ok(_) => {},
-            Err(e) => {
-                eprintln!("Failed to kill process: {}", e);
-            }
-        };    
+        // Send message to the task to shut down
+        let _ = self.inner.shutdown_chan.send(());
+        // Wait for the task to finish
+        self.get_state().cancel_token.cancelled().await;
         Ok(())
     }
 
     pub fn shutdown_in_task(&self) -> Result<(), BaseError> {
-        // Give some time for the process to exit gracefully
-        let proc_handle = self.inner.proc_handle.clone();
-        self.get_state().cancel_token.cancel();
-        let fut = async move {
-            match proc_handle.write().await.kill().await {
-                Ok(_) => {},
-                Err(e) => {
-                    eprintln!("Failed to kill process: {}", e);
-                }
-            };    
-        };
-        tokio::task::spawn(fut);
+        // Send message to the task to shut down
+        let _ = self.inner.shutdown_chan.send(());
         Ok(())
     }
 }

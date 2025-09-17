@@ -26,6 +26,9 @@ enum MpTaskMessage {
         x: i32,
         resp: concurrentlyexec::OneshotSender<i32>,
     },
+    Panic {
+        resp: concurrentlyexec::OneshotSender<()>,
+    },
     AddToTestStruct {
         s: TestStruct,
         resp: concurrentlyexec::OneshotSender<TestStruct>,
@@ -71,6 +74,9 @@ impl ConcurrentlyExecute for MpTask {
                             ns.a += 10;
                             ns.b = format!("{} (modified)", ns.b);
                             let _ = resp.client(&ctx).send(ns);
+                        }
+                        MpTaskMessage::Panic { resp: _ } => {
+                            panic!("Intentional panic from child");
                         }
                     }
                 }
@@ -151,6 +157,17 @@ async fn host() {
         assert!(response == i * 10);
     }
     println!("Time taken for bulk x10: {:?}", time.elapsed());
+
+    // Send panic
+    println!("====== Testing panic handling ======");
+    let time = std::time::Instant::now();
+    let (tx, rx) = executor.create_oneshot();
+    msg_tx.server(ctx).send(MpTaskMessage::Panic { resp: tx }).unwrap();
+    println!("Time taken [send]: {:?}", time.elapsed());
+    let response = rx.recv().await;
+    println!("Time taken: {:?}", time.elapsed());
+    assert!(response.is_err());
+    println!("Child panicked as expected: {:?}", response);
 
     executor.shutdown().await.unwrap();
 
