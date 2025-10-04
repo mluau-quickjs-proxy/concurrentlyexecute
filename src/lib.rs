@@ -248,6 +248,8 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
             loop {
                 tokio::select! {
                     _ = shutdown_rx.recv() => {
+                        // Wait for the process to exit
+                        let _ = proc_handle.kill().await;
                         ctoken.cancel();
                         break;
                     }
@@ -376,7 +378,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
     /// Shuts down the executor
     pub async fn shutdown(&self) -> Result<(), BaseError> {
         // Send message to the task to shut down
-        let _ = self.inner.shutdown_chan.send(());
+        self.inner.shutdown_chan.send(())?;
         // Wait for the task to finish
         self.get_state().cancel_token.cancelled().await;
         Ok(())
