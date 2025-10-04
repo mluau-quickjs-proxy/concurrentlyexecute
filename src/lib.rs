@@ -378,7 +378,7 @@ impl<T: ConcurrentlyExecute> ConcurrentExecutor<T> {
     /// Shuts down the executor
     pub async fn shutdown(&self) -> Result<(), BaseError> {
         // Send message to the task to shut down
-        self.inner.shutdown_chan.send(())?;
+        let _ = self.inner.shutdown_chan.send(());
         // Wait for the task to finish
         self.get_state().cancel_token.cancelled().await;
         Ok(())
